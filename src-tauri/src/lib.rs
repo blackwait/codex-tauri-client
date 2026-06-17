@@ -48,6 +48,11 @@ fn codex_start_thread(state: State<'_, SharedCodexBridge>, cwd: Option<String>, 
 }
 
 #[tauri::command]
+fn codex_start_thread_sync(state: State<'_, SharedCodexBridge>, cwd: Option<String>, model: Option<String>) -> Result<String, String> {
+  state.0.start_thread_sync(cwd, model, 120)
+}
+
+#[tauri::command]
 fn codex_list_threads(state: State<'_, SharedCodexBridge>, cwd: Option<String>, search_term: Option<String>) -> Result<u64, String> {
   state.0.list_threads(cwd, search_term)
 }
@@ -60,6 +65,11 @@ fn codex_resume_thread(state: State<'_, SharedCodexBridge>, thread_id: String) -
 #[tauri::command]
 fn codex_read_thread(state: State<'_, SharedCodexBridge>, thread_id: String, include_turns: bool) -> Result<u64, String> {
   state.0.read_thread(thread_id, include_turns)
+}
+
+#[tauri::command]
+fn codex_read_thread_sync(state: State<'_, SharedCodexBridge>, thread_id: String, include_turns: bool) -> Result<serde_json::Value, String> {
+  state.0.read_thread_sync(thread_id, include_turns, 30)
 }
 
 #[tauri::command]
@@ -308,7 +318,7 @@ struct CodexCheckResult {
 
 #[tauri::command]
 fn codex_check() -> CodexCheckResult {
-  let output = std::process::Command::new("codex").arg("--version").output();
+  let output = codex_bridge::codex_command().arg("--version").output();
   match output {
     Ok(out) if out.status.success() => CodexCheckResult {
       installed: true,
@@ -428,9 +438,11 @@ pub fn run() {
       codex_stop,
       codex_initialize,
       codex_start_thread,
+      codex_start_thread_sync,
       codex_list_threads,
       codex_resume_thread,
       codex_read_thread,
+      codex_read_thread_sync,
       codex_start_turn,
       codex_steer_turn,
       codex_interrupt_turn,

@@ -2,10 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,10 +35,51 @@ struct CodexProcess {
   stdin: ChildStdin,
 }
 
+pub fn codex_executable() -> String {
+  if let Ok(value) = std::env::var("CODEX_BIN") {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+      return trimmed.to_string();
+    }
+  }
+  for candidate in ["/usr/local/bin/codex", "/opt/homebrew/bin/codex"] {
+    if Path::new(candidate).exists() {
+      return candidate.to_string();
+    }
+  }
+  "codex".to_string()
+}
+
+fn enriched_path() -> String {
+  let current = std::env::var("PATH").unwrap_or_default();
+  let mut parts = vec![
+    "/usr/local/bin".to_string(),
+    "/opt/homebrew/bin".to_string(),
+    "/usr/bin".to_string(),
+    "/bin".to_string(),
+  ];
+  for segment in current.split(':') {
+    if segment.is_empty() {
+      continue;
+    }
+    if !parts.iter().any(|existing| existing == segment) {
+      parts.push(segment.to_string());
+    }
+  }
+  parts.join(":")
+}
+
+pub fn codex_command() -> Command {
+  let mut command = Command::new(codex_executable());
+  command.env("PATH", enriched_path());
+  command
+}
+
 #[derive(Debug)]
 pub struct CodexBridgeState {
   process: Mutex<Option<CodexProcess>>,
   pending: Mutex<HashMap<u64, String>>,
+  response_waiters: Mutex<HashMap<u64, mpsc::Sender<RpcEnvelope>>>,
   next_id: AtomicU64,
   initialized: Mutex<bool>,
   last_error: Mutex<Option<String>>,
@@ -46,6 +90,7 @@ impl CodexBridgeState {
     Self {
       process: Mutex::new(None),
       pending: Mutex::new(HashMap::new()),
+      response_waiters: Mutex::new(HashMap::new()),
       next_id: AtomicU64::new(1),
       initialized: Mutex::new(false),
       last_error: Mutex::new(None),
@@ -66,7 +111,7 @@ impl CodexBridgeState {
       return Ok(self.status());
     }
 
-    let mut child = match Command::new("codex")
+    let mut child = match codex_command()
       .arg("app-server")
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
@@ -165,7 +210,12 @@ Make sure `codex` is installed and available on PATH."
           "version": env!("CARGO_PKG_VERSION")
         },
         "capabilities": {
-          "experimentalApi": true
+          "experimentalApi": true,
+          "requestAttestation": false,
+          "optOutNotificationMethods": [
+            "mcpServer/startupStatus/updated",
+            "remoteControl/status/changed"
+          ]
         }
       }),
     )?;
@@ -175,7 +225,28 @@ Make sure `codex` is installed and available on PATH."
   }
 
   pub fn start_thread(&self, cwd: Option<String>, model: Option<String>) -> Result<u64, String> {
-    let mut params = json!({});
+    self.send_thread_start(cwd, model)
+  }
+
+  pub fn start_thread_sync(&self, cwd: Option<String>, model: Option<String>, timeout_secs: u64) -> Result<String, String> {
+    let request_id = self.send_thread_start(cwd, model)?;
+    let (tx, rx) = mpsc::channel();
+    self
+      .response_waiters
+      .lock()
+      .map_err(lock_error)?
+      .insert(request_id, tx);
+    let envelope = rx
+      .recv_timeout(Duration::from_secs(timeout_secs))
+      .map_err(|_| format!("thread/start timed out after {timeout_secs}s"))?;
+    thread_id_from_envelope(&envelope)
+  }
+
+  fn send_thread_start(&self, cwd: Option<String>, model: Option<String>) -> Result<u64, String> {
+    let mut params = json!({
+      "developerInstructions": "你是企业聊天客户端。优先直接回答用户问题；仅在用户明确要求时使用技能、工具或 MCP。简单对话不要加载或执行技能流程。",
+      "personality": "pragmatic"
+    });
     if let Some(cwd) = cwd {
       params["cwd"] = Value::String(cwd);
     }
@@ -217,10 +288,30 @@ Make sure `codex` is installed and available on PATH."
     )
   }
 
+  pub fn read_thread_sync(&self, thread_id: String, include_turns: bool, timeout_secs: u64) -> Result<Value, String> {
+    let request_id = self.read_thread(thread_id, include_turns)?;
+    let (tx, rx) = mpsc::channel();
+    self
+      .response_waiters
+      .lock()
+      .map_err(lock_error)?
+      .insert(request_id, tx);
+    let envelope = rx
+      .recv_timeout(Duration::from_secs(timeout_secs))
+      .map_err(|_| format!("thread/read timed out after {timeout_secs}s"))?;
+    if let Some(error) = &envelope.error {
+      return Err(error.to_string());
+    }
+    envelope
+      .result
+      .ok_or_else(|| "thread/read returned no result".to_string())
+  }
+
   pub fn start_turn(&self, thread_id: String, text: String, cwd: Option<String>) -> Result<u64, String> {
     let mut params = json!({
       "threadId": thread_id,
-      "input": [{ "type": "text", "text": text }]
+      "input": [{ "type": "text", "text": text }],
+      "developerInstructions": "优先直接回答。仅在用户明确要求时使用技能、工具或 MCP。"
     });
     if let Some(cwd) = cwd {
       params["cwd"] = Value::String(cwd);
@@ -485,6 +576,11 @@ Make sure `codex` is installed and available on PATH."
     match serde_json::from_str::<RpcEnvelope>(&line) {
       Ok(mut envelope) => {
         if let Some(id) = envelope.id {
+          if let Ok(mut waiters) = self.response_waiters.lock() {
+            if let Some(tx) = waiters.remove(&id) {
+              let _ = tx.send(envelope.clone());
+            }
+          }
           if let Ok(mut pending) = self.pending.lock() {
             envelope.request_method = pending.remove(&id);
           }
@@ -516,4 +612,20 @@ Make sure `codex` is installed and available on PATH."
 
 fn lock_error<T>(err: std::sync::PoisonError<T>) -> String {
   format!("internal lock poisoned: {err}")
+}
+
+fn thread_id_from_envelope(envelope: &RpcEnvelope) -> Result<String, String> {
+  if let Some(error) = &envelope.error {
+    return Err(error.to_string());
+  }
+  let result = envelope.result.as_ref().ok_or_else(|| "thread/start returned no result".to_string())?;
+  if let Some(thread) = result.get("thread") {
+    if let Some(id) = thread.get("id").and_then(|value| value.as_str()) {
+      return Ok(id.to_string());
+    }
+  }
+  if let Some(id) = result.get("threadId").and_then(|value| value.as_str()) {
+    return Ok(id.to_string());
+  }
+  Err(format!("thread/start result missing thread id: {result}"))
 }

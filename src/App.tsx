@@ -53,12 +53,16 @@ type RpcEnvelope = {
 
 type TimelineItem = {
   id: string;
-  kind: 'agent' | 'tool' | 'system' | 'error' | 'approval';
+  kind: 'agent' | 'user' | 'tool' | 'system' | 'error' | 'approval';
   title: string;
   body: string;
   subtype?: string;
   turnIndex?: number;
 };
+
+function isChatMessage(event: TimelineItem) {
+  return event.kind === 'agent' || event.kind === 'user';
+}
 
 const MarkdownBlock = React.memo(function MarkdownBlock({ value }: { value: string }) {
   return <pre className="event-mono">{value}</pre>;
@@ -66,8 +70,9 @@ const MarkdownBlock = React.memo(function MarkdownBlock({ value }: { value: stri
 
 type ChatComposerProps = {
   busy: boolean;
-  codexInstalled: boolean;
-  statusRunning: boolean;
+  waitingForReply: boolean;
+  streamingText: string;
+  replyHint: string | null;
   sessionMode: SessionMode;
   onSessionModeChange: (mode: SessionMode) => void;
   onSend: (text: string) => void | Promise<void>;
@@ -76,25 +81,27 @@ type ChatComposerProps = {
 
 const ChatComposer = React.memo(function ChatComposer({
   busy,
-  codexInstalled,
-  statusRunning,
+  waitingForReply,
+  streamingText,
+  replyHint,
   sessionMode,
   onSessionModeChange,
   onSend,
   onNewThread,
 }: ChatComposerProps) {
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const sending = busy || waitingForReply;
 
   const submit = async () => {
     const text = (inputRef.current?.value ?? '').trim();
-    if (!text || busy || !codexInstalled) return;
+    if (!text || sending) return;
     if (inputRef.current) inputRef.current.value = '';
     await onSend(text);
   };
 
   return (
     <div className="composer enterprise-composer">
-      <button className="plus-button" onClick={onNewThread} disabled={busy || !codexInstalled}>
+      <button className="plus-button" onClick={onNewThread} disabled={sending}>
         <Plus size={18} />
       </button>
       <textarea
@@ -125,12 +132,11 @@ const ChatComposer = React.memo(function ChatComposer({
             Worktree
           </button>
         </div>
-        <span className={statusRunning ? 'permission active' : 'permission'}>
-          <ShieldCheck size={14} />
-          {statusRunning ? '企业连接已启用' : '未连接（发送时自动连接）'}
-        </span>
-        <button className="send-button" onClick={() => void submit()} disabled={busy || !codexInstalled}>
-          {busy ? <Loader2 size={17} /> : <ArrowUp size={17} />}
+        {waitingForReply || streamingText ? (
+          <span className="composer-status thinking">{streamingText || replyHint || '思考中…'}</span>
+        ) : null}
+        <button className="send-button" onClick={() => void submit()} disabled={sending}>
+          {sending ? <Loader2 size={17} className="spin" /> : <ArrowUp size={17} />}
         </button>
       </div>
     </div>
@@ -577,7 +583,6 @@ function timelineFromThreadRead(result: unknown): TimelineItem[] {
   let idx = 0;
   for (const turn of turns) {
     idx += 1;
-    items.push({ id: crypto.randomUUID(), kind: 'system', subtype: 'turn', title: `第 ${idx} 轮`, body: '', turnIndex: idx });
     const turnItems = Array.isArray(turn?.items) ? turn.items : [];
     for (const item of turnItems) {
       const type = item?.type as string | undefined;
@@ -589,7 +594,7 @@ function timelineFromThreadRead(result: unknown): TimelineItem[] {
           .join('\n');
         items.push({
           id: crypto.randomUUID(),
-          kind: 'system',
+          kind: 'user',
           title: '用户',
           body: text || toPretty(item),
           turnIndex: idx,
@@ -604,102 +609,26 @@ function timelineFromThreadRead(result: unknown): TimelineItem[] {
           body: typeof item?.text === 'string' ? item.text : toPretty(item),
           turnIndex: idx,
         });
-        continue;
       }
-      if (type === 'plan') {
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'tool',
-          subtype: 'plan',
-          title: '计划',
-          body: typeof item?.text === 'string' ? item.text : toPretty(item),
-          turnIndex: idx,
-        });
-        continue;
-      }
-      if (type === 'commandExecution') {
-        const command = typeof item?.command === 'string' ? item.command : 'command';
-        const output = typeof item?.aggregatedOutput === 'string' ? item.aggregatedOutput : '';
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'tool',
-          subtype: 'commandExecution',
-          title: `命令：${command}`,
-          body: output || toPretty(item),
-          turnIndex: idx,
-        });
-        continue;
-      }
-      if (type === 'fileChange') {
-        const summary = formatFileChangeSummary(item?.changes);
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'tool',
-          subtype: 'fileChange',
-          title: '文件变更',
-          body: summary || toPretty(item?.changes ?? item),
-          turnIndex: idx,
-        });
-        continue;
-      }
-
-      if (type === 'mcpToolCall') {
-        const server = typeof item?.server === 'string' ? item.server : 'mcp';
-        const tool = typeof item?.tool === 'string' ? item.tool : 'tool';
-        const status = typeof item?.status === 'string' ? ` · ${item.status}` : '';
-        const args = item?.arguments ? `arguments:\n${toPretty(item.arguments)}\n\n` : '';
-        const result = item?.result ? `result:\n${toPretty(item.result)}` : item?.error ? `error:\n${toPretty(item.error)}` : '';
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'tool',
-          subtype: 'mcpToolCall',
-          title: `MCP：${server}/${tool}${status}`,
-          body: `${args}${result}`.trim() || toPretty(item),
-          turnIndex: idx,
-        });
-        continue;
-      }
-
-      if (type === 'dynamicToolCall') {
-        const tool = typeof item?.tool === 'string' ? item.tool : 'tool';
-        const status = typeof item?.status === 'string' ? ` · ${item.status}` : '';
-        const args = item?.arguments ? `arguments:\n${toPretty(item.arguments)}\n\n` : '';
-        const success = typeof item?.success === 'boolean' ? `success: ${item.success}\n\n` : '';
-        const contentItems = item?.contentItems ? `contentItems:\n${toPretty(item.contentItems)}\n\n` : '';
-        const error = item?.error ? `error:\n${toPretty(item.error)}` : '';
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'tool',
-          subtype: 'dynamicToolCall',
-          title: `动态工具：${tool}${status}`,
-          body: `${args}${success}${contentItems}${error}`.trim() || toPretty(item),
-          turnIndex: idx,
-        });
-        continue;
-      }
-
-      if (type === 'reasoning') {
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'tool',
-          subtype: 'reasoning',
-          title: '推理摘要',
-          body: typeof item?.summary === 'string' ? item.summary : (typeof item?.text === 'string' ? item.text : toPretty(item)),
-          turnIndex: idx,
-        });
-        continue;
-      }
-
-      items.push({
-        id: crypto.randomUUID(),
-        kind: 'system',
-        title: type ? `事件：${type}` : '事件',
-        body: toPretty(item),
-      });
     }
   }
 
-  return items.length > 0 ? items : [{ id: crypto.randomUUID(), kind: 'system', title: '会话已加载', body: toPretty(result) }];
+  return items;
+}
+
+function latestAgentFromThreadRead(result: unknown): string | null {
+  const msgs = timelineFromThreadRead(result);
+  const latestAgent = [...msgs].reverse().find((m) => m.kind === 'agent');
+  const body = latestAgent?.body?.trim();
+  return body ? body : null;
+}
+
+function isLatestTurnFinished(result: unknown): boolean {
+  const thread = (result as { thread?: { turns?: Array<{ status?: string }> } })?.thread ?? result;
+  const turns = Array.isArray((thread as { turns?: unknown[] })?.turns) ? (thread as { turns: Array<{ status?: string }> }).turns : [];
+  const last = turns[turns.length - 1];
+  const status = typeof last?.status === 'string' ? last.status : '';
+  return status === 'completed' || status === 'failed' || status === 'interrupted';
 }
 
 export default function App() {
@@ -710,9 +639,7 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [codexCheck, setCodexCheck] = useState<CodexCheckResult | null>(null);
-  const [timeline, setTimeline] = useState<TimelineItem[]>([
-    { id: 'boot', kind: 'system', title: '准备就绪', body: autoConnectMessage },
-  ]);
+  const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>(staticConversations);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [skills, setSkills] = useState<InventoryItem[]>([]);
@@ -743,6 +670,11 @@ export default function App() {
   const [clearMetadataOrigin, setClearMetadataOrigin] = useState(false);
   const [activeNav, setActiveNav] = useState('新对话');
   const [busy, setBusy] = useState(false);
+  const [waitingForReply, setWaitingForReply] = useState(false);
+  const [replyHint, setReplyHint] = useState<string | null>(null);
+  const [streamingText, setStreamingText] = useState('');
+  const replySlowTimerRef = useRef<number | null>(null);
+  const replyTimeoutTimerRef = useRef<number | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [terminalCommand, setTerminalCommand] = useState('pwd');
   const [terminalLog, setTerminalLog] = useState<string>('');
@@ -765,6 +697,11 @@ export default function App() {
   const pendingCreateSessionProjectIdRef = useRef<number | null>(null);
   const pendingSessionModeRef = useRef<SessionMode>('local');
   const threadIdRef = useRef<string | null>(null);
+  const threadWarmupRef = useRef<Promise<string | null> | null>(null);
+  const waitingForReplyRef = useRef(false);
+  const streamingTextRef = useRef('');
+  const threadReadPollRef = useRef<number | null>(null);
+  const replyPollTokenRef = useRef<string | null>(null);
   const selectedProjectIdRef = useRef<number | null>(null);
   const projectPathRef = useRef(defaultProject);
   const projectsRef = useRef<Project[]>([]);
@@ -781,6 +718,57 @@ export default function App() {
   const [turnState, setTurnState] = useState<'idle' | 'thinking' | 'runningTools'>('idle');
   const [editingProjectId, setEditingProjectId] = useState<number | null>(null);
   const [editingProjectName, setEditingProjectName] = useState('');
+
+  const commitAgentReplyRef = useRef<(body: string, finalize?: boolean) => void>(() => {});
+  commitAgentReplyRef.current = (body: string, finalize = false) => {
+    const text = body.trim();
+    if (!text) return;
+    setStreamingText(text);
+    setTimeline((current) => {
+      const stream = streamingAgentRef.current;
+      if (stream) {
+        const exists = current.some((evt) => evt.id === stream.timelineId);
+        if (exists) {
+          return current.map((evt) => (evt.id === stream.timelineId ? { ...evt, body: text } : evt));
+        }
+        return [
+          ...current,
+          { id: stream.timelineId, kind: 'agent' as const, title: '助手', body: text, turnIndex: turnIndexRef.current },
+        ];
+      }
+      const duplicate = current.some((item) => item.kind === 'agent' && item.body === text);
+      if (duplicate) return current;
+      const id = crypto.randomUUID();
+      streamingAgentRef.current = { itemId: id, timelineId: id };
+      return [...current, { id, kind: 'agent' as const, title: '助手', body: text, turnIndex: turnIndexRef.current }];
+    });
+    if (finalize) {
+      streamingAgentRef.current = null;
+      streamingToolRef.current.clear();
+      latestDiffTimelineIdRef.current = null;
+      setTurnState('idle');
+      setWaitingForReply(false);
+      setStreamingText('');
+    }
+  };
+
+  async function syncPollAgentReply(threadId: string, pollToken: string) {
+    const delays = [600, 1200, 2000, 3500, 5000, 8000, 12000, 20000, 30000];
+    for (const delay of delays) {
+      await new Promise((resolve) => window.setTimeout(resolve, delay));
+      if (replyPollTokenRef.current !== pollToken || !waitingForReplyRef.current) return;
+      try {
+        const result = await invoke<unknown>('codex_read_thread_sync', { threadId, includeTurns: true });
+        const agentText = latestAgentFromThreadRead(result);
+        if (agentText) {
+          commitAgentReplyRef.current(agentText, isLatestTurnFinished(result));
+          if (isLatestTurnFinished(result)) return;
+        }
+      } catch {
+        // ignore transient read failures while the turn is still running
+      }
+    }
+  }
 
   useEffect(() => {
     threadIdRef.current = threadId;
@@ -803,8 +791,74 @@ export default function App() {
   }, [execProcessId]);
 
   useEffect(() => {
+    waitingForReplyRef.current = waitingForReply;
+  }, [waitingForReply]);
+
+  useEffect(() => {
+    streamingTextRef.current = streamingText;
+  }, [streamingText]);
+
+  useEffect(() => {
     turnIndexRef.current = turnIndex;
   }, [turnIndex]);
+
+  useEffect(() => {
+    if (replySlowTimerRef.current != null) {
+      window.clearTimeout(replySlowTimerRef.current);
+      replySlowTimerRef.current = null;
+    }
+    if (replyTimeoutTimerRef.current != null) {
+      window.clearTimeout(replyTimeoutTimerRef.current);
+      replyTimeoutTimerRef.current = null;
+    }
+    if (!waitingForReply) {
+      setReplyHint(null);
+      return;
+    }
+    setReplyHint(null);
+    replySlowTimerRef.current = window.setTimeout(() => {
+      setReplyHint('后台仍在处理，首轮通常需要 20–60 秒…');
+    }, 30000);
+    replyTimeoutTimerRef.current = window.setTimeout(() => {
+      setReplyHint('已等待较久，后台可能卡住。可点击「中断」后重试。');
+    }, 120000);
+    return () => {
+      if (replySlowTimerRef.current != null) {
+        window.clearTimeout(replySlowTimerRef.current);
+        replySlowTimerRef.current = null;
+      }
+      if (replyTimeoutTimerRef.current != null) {
+        window.clearTimeout(replyTimeoutTimerRef.current);
+        replyTimeoutTimerRef.current = null;
+      }
+    };
+  }, [waitingForReply]);
+
+  useEffect(() => {
+    if (threadReadPollRef.current != null) {
+      window.clearInterval(threadReadPollRef.current);
+      threadReadPollRef.current = null;
+    }
+    if (!waitingForReply) return;
+    threadReadPollRef.current = window.setInterval(() => {
+      const tid = threadIdRef.current;
+      if (!tid || !waitingForReplyRef.current) return;
+      invoke<unknown>('codex_read_thread_sync', { threadId: tid, includeTurns: true })
+        .then((result) => {
+          const agentText = latestAgentFromThreadRead(result);
+          if (agentText) {
+            commitAgentReplyRef.current(agentText, isLatestTurnFinished(result));
+          }
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => {
+      if (threadReadPollRef.current != null) {
+        window.clearInterval(threadReadPollRef.current);
+        threadReadPollRef.current = null;
+      }
+    };
+  }, [waitingForReply]);
 
   useEffect(() => {
     if (!threadGitInfo) return;
@@ -817,7 +871,7 @@ export default function App() {
     const node = timelineScrollRef.current;
     if (!node) return;
     node.scrollTop = node.scrollHeight;
-  }, [timeline]);
+  }, [timeline, waitingForReply, streamingText]);
 
   useEffect(() => {
     const unsubs: Array<() => void> = [];
@@ -855,8 +909,10 @@ export default function App() {
         setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'error', title: '读取项目列表失败', body: String(error) }]);
       });
 
-    listen<CodexStatus>('codex:status', (event) => setStatus(event.payload)).then((unlisten) => unsubs.push(unlisten));
-    listen<RpcEnvelope>('codex:message', (event) => {
+    const registerListeners = async () => {
+      unsubs.push(await listen<CodexStatus>('codex:status', (event) => setStatus(event.payload)));
+      unsubs.push(
+        await listen<RpcEnvelope>('codex:message', (event) => {
       const envelope = event.payload;
       const method = envelope.method;
       const requestMethod = envelope.request_method;
@@ -881,6 +937,16 @@ export default function App() {
           return next;
         });
         setTurnState('thinking');
+        setWaitingForReply(true);
+        return;
+      }
+
+      if (method === 'error' && envelope.params) {
+        setWaitingForReply(false);
+        setTimeline((current) => [
+          ...current,
+          { id: crypto.randomUUID(), kind: 'agent', title: '助手', body: `服务错误：${toPretty(envelope.params)}` },
+        ]);
         return;
       }
 
@@ -888,15 +954,11 @@ export default function App() {
         const params = envelope.params as { itemId?: string; delta?: string };
         const delta = params.delta ?? '';
         if (delta) {
-          setTimeline((current) => {
-            const stream = streamingAgentRef.current;
-            if (stream && stream.itemId === params.itemId) {
-              return current.map((item) => (item.id === stream.timelineId ? { ...item, body: item.body + delta } : item));
-            }
+          if (!streamingAgentRef.current) {
             const id = crypto.randomUUID();
             streamingAgentRef.current = { itemId: params.itemId ?? id, timelineId: id };
-            return [...current, { id, kind: 'agent', title: '助手', body: delta, turnIndex: turnIndexRef.current }];
-          });
+          }
+          setStreamingText((prev) => prev + delta);
         }
         return;
       }
@@ -951,6 +1013,14 @@ export default function App() {
         const item = asItem(envelope.params);
         if (item?.id && item?.type) {
           const itemId = String(item.id);
+          if (item.type === 'agentMessage' && method === 'item/completed') {
+            const text = typeof item.text === 'string' ? item.text : '';
+            const phase = typeof item.phase === 'string' ? item.phase : '';
+            if (text) {
+              commitAgentReplyRef.current(text, phase === 'final_answer');
+            }
+            return;
+          }
           if (item.type === 'commandExecution') {
             if (method === 'item/started') {
               setTurnState('runningTools');
@@ -1137,10 +1207,18 @@ export default function App() {
       }
 
       if (method === 'turn/completed') {
-        streamingAgentRef.current = null;
-        streamingToolRef.current.clear();
-        latestDiffTimelineIdRef.current = null;
-        setTurnState('idle');
+        const finalText = streamingTextRef.current.trim();
+        if (finalText) {
+          commitAgentReplyRef.current(finalText, true);
+        } else {
+          streamingAgentRef.current = null;
+          streamingToolRef.current.clear();
+          latestDiffTimelineIdRef.current = null;
+          setTurnState('idle');
+          setWaitingForReply(false);
+          setStreamingText('');
+        }
+        return;
       }
 
       const notifyThreadId = extractThreadIdFromNotification(method, envelope.params);
@@ -1237,29 +1315,39 @@ export default function App() {
       }
 
       if (requestMethod === 'thread/read' && envelope.result) {
-        setTimeline(timelineFromThreadRead(envelope.result));
-        setThreadGitInfo(extractThreadGitInfo(envelope.result));
-        setThreadSettingsView(extractThreadSettings(envelope.result));
-        skipAppend = true;
+        const chatMsgs = timelineFromThreadRead(envelope.result);
+        const latestAgent = [...chatMsgs].reverse().find((m) => m.kind === 'agent');
 
-        const projectId = selectedProjectIdRef.current;
-        const thread = (envelope.result as any)?.thread ?? (envelope.result as any);
-        const tid = typeof thread?.id === 'string' ? thread.id : null;
-        if (projectId && tid) {
-          const title = (typeof thread?.name === 'string' && thread.name.trim()) ? thread.name : (typeof thread?.preview === 'string' ? thread.preview : null);
-          const updatedAt = typeof thread?.updatedAt === 'number' ? thread.updatedAt : nowSeconds();
-          invoke('session_upsert', {
-            projectId,
-            threadId: tid,
-            mode: null,
-            worktreePath: null,
-            title: title || undefined,
-            updatedAt,
-            status: thread?.status ? String(thread.status) : undefined,
-          })
-            .then(() => invoke<SessionRow[]>('sessions_for_project', { projectId }))
-            .then((next) => setSessions(next))
-            .catch(() => {});
+        if (waitingForReplyRef.current) {
+          if (latestAgent?.body) {
+            commitAgentReplyRef.current(latestAgent.body, isLatestTurnFinished(envelope.result));
+          }
+          skipAppend = true;
+        } else {
+          setTimeline(chatMsgs);
+          setThreadGitInfo(extractThreadGitInfo(envelope.result));
+          setThreadSettingsView(extractThreadSettings(envelope.result));
+          skipAppend = true;
+
+          const projectId = selectedProjectIdRef.current;
+          const thread = (envelope.result as any)?.thread ?? (envelope.result as any);
+          const tid = typeof thread?.id === 'string' ? thread.id : null;
+          if (projectId && tid) {
+            const title = (typeof thread?.name === 'string' && thread.name.trim()) ? thread.name : (typeof thread?.preview === 'string' ? thread.preview : null);
+            const updatedAt = typeof thread?.updatedAt === 'number' ? thread.updatedAt : nowSeconds();
+            invoke('session_upsert', {
+              projectId,
+              threadId: tid,
+              mode: null,
+              worktreePath: null,
+              title: title || undefined,
+              updatedAt,
+              status: thread?.status ? String(thread.status) : undefined,
+            })
+              .then(() => invoke<SessionRow[]>('sessions_for_project', { projectId }))
+              .then((next) => setSessions(next))
+              .catch(() => {});
+          }
         }
       }
 
@@ -1282,23 +1370,31 @@ export default function App() {
 
       if (nextThreadId) {
         setThreadId(nextThreadId);
-        const pendingPrompt = pendingPromptRef.current;
-        if (pendingPrompt) {
-          pendingPromptRef.current = null;
-          invoke<number>('codex_start_turn', { threadId: nextThreadId, text: pendingPrompt, cwd: projectPathRef.current || null })
-            .then(() => {})
-            .catch((error) => appendError('待发送消息提交失败', error));
-        }
+        threadIdRef.current = nextThreadId;
       }
 
-      if (!skipAppend) {
-        const item = classifyEnvelope(envelope);
-        if (requestMethod !== 'thread/read') {
-          setTimeline((current) => [...current, item]);
-        }
+      if (envelope.error && requestMethod === 'thread/start') {
+        threadWarmupRef.current = null;
       }
-    }).then((unlisten) => unsubs.push(unlisten));
-    listen<{ line: string }>('codex:stderr', (event) => {
+
+      if (envelope.error && requestMethod === 'turn/start') {
+        setWaitingForReply(false);
+        setTimeline((current) => [
+          ...current,
+          { id: crypto.randomUUID(), kind: 'agent', title: '助手', body: `对话失败：${toPretty(envelope.error)}` },
+        ]);
+      }
+
+        if (!skipAppend) {
+          const item = classifyEnvelope(envelope);
+          if (requestMethod !== 'thread/read') {
+            setTimeline((current) => [...current, item]);
+          }
+        }
+        }),
+      );
+      unsubs.push(
+        await listen<{ line: string }>('codex:stderr', (event) => {
       const line = event.payload.line;
       if (!line) return;
       const next = `${serviceLogPendingRef.current}${serviceLogPendingRef.current ? '\n' : ''}${line}`.split('\n').slice(-50).join('\n');
@@ -1318,29 +1414,46 @@ export default function App() {
           copy[existingIdx] = item;
           return copy;
         });
-      }, 250);
-    }).then((unlisten) => unsubs.push(unlisten));
-    listen<{ line: string; error: string }>('codex:unparsed', (event) => {
-      setTimeline((current) => [
-        ...current,
-        { id: crypto.randomUUID(), kind: 'error', title: '无法解析的服务输出', body: `${event.payload.error}\n${event.payload.line}` },
-      ]);
-    }).then((unlisten) => unsubs.push(unlisten));
+        }, 250);
+        }),
+      );
+      unsubs.push(
+        await listen<{ line: string; error: string }>('codex:unparsed', (event) => {
+          setTimeline((current) => [
+            ...current,
+            { id: crypto.randomUUID(), kind: 'error', title: '无法解析的服务输出', body: `${event.payload.error}\n${event.payload.line}` },
+          ]);
+        }),
+      );
 
-    if (!bootstrappedRef.current) {
-      bootstrappedRef.current = true;
-      connectCodex(false)
-        .then((connected) => {
-          if (connected) return refreshEnterpriseCapabilities();
-          return undefined;
-        })
-        .catch((error) => appendError('企业研发助手连接失败', error));
-    }
+      if (!bootstrappedRef.current) {
+        bootstrappedRef.current = true;
+        connectCodex(false)
+          .then(async (connected) => {
+            if (!connected) return undefined;
+            warmupThread().catch(() => {});
+            window.setTimeout(() => {
+              refreshEnterpriseCapabilities().catch(() => {});
+            }, 8000);
+            return undefined;
+          })
+          .catch((error) => appendError('企业研发助手连接失败', error));
+      }
+    };
+    void registerListeners();
 
     return () => {
       if (serviceLogFlushTimerRef.current != null) {
         window.clearTimeout(serviceLogFlushTimerRef.current);
         serviceLogFlushTimerRef.current = null;
+      }
+      if (replySlowTimerRef.current != null) {
+        window.clearTimeout(replySlowTimerRef.current);
+        replySlowTimerRef.current = null;
+      }
+      if (replyTimeoutTimerRef.current != null) {
+        window.clearTimeout(replyTimeoutTimerRef.current);
+        replyTimeoutTimerRef.current = null;
       }
       unsubs.forEach((unlisten) => unlisten());
     };
@@ -1381,6 +1494,9 @@ export default function App() {
     let nextStatus = currentStatus;
     if (!nextStatus.running) {
       nextStatus = await invoke<CodexStatus>('codex_start');
+      setThreadId(null);
+      threadIdRef.current = null;
+      threadWarmupRef.current = null;
     }
     if (!nextStatus.initialized) {
       await invoke<number>('codex_initialize', { clientName: 'codex_enterprise_client' });
@@ -1414,6 +1530,8 @@ export default function App() {
       const nextStatus = await invoke<CodexStatus>('codex_stop');
       setStatus(nextStatus);
       setThreadId(null);
+      threadIdRef.current = null;
+      threadWarmupRef.current = null;
     } catch (error) {
       appendError('Codex 服务停止失败', error);
     } finally {
@@ -1469,31 +1587,81 @@ export default function App() {
     }
   }
 
+  async function warmupThread() {
+    if (threadIdRef.current) return threadIdRef.current;
+    if (threadWarmupRef.current) return threadWarmupRef.current;
+    const task = (async () => {
+      if (selectedProjectIdRef.current) {
+        pendingCreateSessionProjectIdRef.current = selectedProjectIdRef.current;
+        pendingSessionModeRef.current = sessionMode;
+      }
+      const id = await invoke<string>('codex_start_thread_sync', {
+        cwd: projectPathRef.current || null,
+        model: null,
+      });
+      setThreadId(id);
+      threadIdRef.current = id;
+      return id;
+    })();
+    threadWarmupRef.current = task;
+    try {
+      return await task;
+    } finally {
+      threadWarmupRef.current = null;
+    }
+  }
+
+  async function ensureThreadId(): Promise<string> {
+    const existing = threadIdRef.current;
+    if (existing) return existing;
+    if (threadWarmupRef.current) {
+      const warmed = await threadWarmupRef.current;
+      if (warmed) return warmed;
+    }
+    if (selectedProjectId) {
+      pendingCreateSessionProjectIdRef.current = selectedProjectId;
+      pendingSessionModeRef.current = sessionMode;
+    }
+    const id = await invoke<string>('codex_start_thread_sync', { cwd: projectPath || null, model: null });
+    setThreadId(id);
+    threadIdRef.current = id;
+    return id;
+  }
+
   async function dispatchPromptText(text: string) {
     if (!text) return;
+    const pollToken = crypto.randomUUID();
+    replyPollTokenRef.current = pollToken;
     setBusy(true);
+    setWaitingForReply(true);
+    setStreamingText('');
+    streamingAgentRef.current = null;
     setTimeline((current) => [
       ...current,
-      { id: crypto.randomUUID(), kind: 'system', title: '用户', body: text },
+      { id: crypto.randomUUID(), kind: 'user', title: '用户', body: text },
     ]);
     try {
-      if (!(await connectCodex(false))) return;
-      if (!threadId) {
-        pendingPromptRef.current = text;
-        if (selectedProjectId) {
-          pendingCreateSessionProjectIdRef.current = selectedProjectId;
-          pendingSessionModeRef.current = sessionMode;
-        }
-        await invoke<number>('codex_start_thread', { cwd: projectPath || null, model: null });
+      if (!(await connectCodex(false))) {
+        replyPollTokenRef.current = null;
+        setWaitingForReply(false);
         setTimeline((current) => [
           ...current,
-          { id: crypto.randomUUID(), kind: 'system', title: '正在准备对话', body: '已创建会话，准备完成后会自动发送。' },
+          { id: crypto.randomUUID(), kind: 'agent', title: '助手', body: '连接失败，请确认 Codex CLI 已安装且可运行。' },
         ]);
         return;
       }
-      await invoke<number>('codex_start_turn', { threadId, text, cwd: projectPath || null });
+      const activeThreadId = await ensureThreadId();
+      await invoke<number>('codex_start_turn', { threadId: activeThreadId, text, cwd: projectPath || null });
+      void syncPollAgentReply(activeThreadId, pollToken);
     } catch (error) {
-      appendError('发送消息失败', error);
+      replyPollTokenRef.current = null;
+      threadWarmupRef.current = null;
+      setWaitingForReply(false);
+      setStreamingText('');
+      setTimeline((current) => [
+        ...current,
+        { id: crypto.randomUUID(), kind: 'agent', title: '助手', body: `发送失败：${String(error)}` },
+      ]);
     } finally {
       setBusy(false);
     }
@@ -1874,6 +2042,8 @@ export default function App() {
     setSelectedProjectId(project.id);
     setProjectPath(project.path);
     setThreadId(null);
+    threadIdRef.current = null;
+    threadWarmupRef.current = null;
     setTimeline([{ id: crypto.randomUUID(), kind: 'system', title: '已切换项目', body: project.path }]);
     try {
       await invoke('project_touch', { projectId: project.id, now: nowSeconds() });
@@ -2164,20 +2334,7 @@ export default function App() {
         return;
       }
       const fallbackPrompt = '请对当前项目未提交改动做一次 code review（找 P0/P1 风险，给出可执行修改建议）。';
-      if (!threadId) {
-        pendingPromptRef.current = fallbackPrompt;
-        if (selectedProjectId) {
-          pendingCreateSessionProjectIdRef.current = selectedProjectId;
-          pendingSessionModeRef.current = sessionMode;
-        }
-        await invoke<number>('codex_start_thread', { cwd: projectPath || null, model: null });
-        setTimeline((current) => [
-          ...current,
-          { id: crypto.randomUUID(), kind: 'system', title: '正在准备 Review 会话', body: '会话创建后将自动发送 review 请求。' },
-        ]);
-        return;
-      }
-      await invoke<number>('codex_start_turn', { threadId, text: fallbackPrompt, cwd: projectPath || null });
+      await dispatchPromptText(fallbackPrompt);
     } catch (error) {
       appendError('启动 review 失败', error);
     }
@@ -2421,43 +2578,25 @@ export default function App() {
     return sessions.filter((s) => (s.title || '').toLowerCase().includes(q) || s.thread_id.toLowerCase().includes(q));
   }, [sessions, searchQuery]);
 
+  const chatTimeline = useMemo(() => timeline.filter(isChatMessage), [timeline]);
+
   const visibleTimeline = useMemo(() => {
-    const limit = 80;
-    if (timeline.length <= limit) return timeline;
-    const hidden = timeline.length - limit;
-    return [
-      {
-        id: 'timeline-truncated',
-        kind: 'system' as const,
-        title: '已折叠历史消息',
-        body: `为提升性能，已隐藏更早的 ${hidden} 条事件（仅渲染最近 ${limit} 条）。`,
-      },
-      ...timeline.slice(-limit),
-    ];
-  }, [timeline]);
+    const limit = 100;
+    if (chatTimeline.length <= limit) return chatTimeline;
+    return chatTimeline.slice(-limit);
+  }, [chatTimeline]);
 
   const renderedTimeline = useMemo(
     () =>
-      visibleTimeline.map((event) =>
-        event.subtype === 'turn' ? (
-          <div key={event.id} className="turn-divider">
-            <span>{event.title}</span>
-            <small>{turnState === 'thinking' ? '思考中…' : turnState === 'runningTools' ? '正在运行工具…' : ''}</small>
-          </div>
-        ) : (
-          <article key={event.id} className={`event ${event.kind}`}>
-            <div className="event-title">{event.title}</div>
-            {event.kind === 'agent' || event.subtype === 'plan' || event.subtype === 'reasoning' ? (
-              <MarkdownBlock value={event.body} />
-            ) : event.kind === 'tool' ? (
-              <pre className="event-mono">{event.body}</pre>
-            ) : (
-              <pre>{event.body}</pre>
-            )}
-          </article>
-        ),
-      ),
-    [visibleTimeline, turnState],
+      visibleTimeline.map((event) => (
+        <article
+          key={event.id}
+          className={`event chat-bubble ${event.kind === 'user' ? 'chat-user' : 'chat-agent'}`}
+        >
+          <pre>{event.body}</pre>
+        </article>
+      )),
+    [visibleTimeline],
   );
 
   return (
@@ -2641,9 +2780,14 @@ export default function App() {
 
         <section className="content-grid enterprise-grid">
           <div className="panel transcript chat-panel">
-            <div className="panel-title">对话与执行过程</div>
+            <div className="panel-title">对话</div>
             <div className="chat-scroll" ref={timelineScrollRef}>
               {renderedTimeline}
+              {waitingForReply || streamingText ? (
+                <article className="event chat-bubble chat-agent chat-thinking">
+                  <pre>{streamingText || replyHint || '思考中…'}</pre>
+                </article>
+              ) : null}
               {pendingApprovals.length > 0 && (
                 <div className="approval-stack">
                   {pendingApprovals.map((approval) => (
@@ -2664,8 +2808,9 @@ export default function App() {
             </div>
             <ChatComposer
               busy={busy}
-              codexInstalled={codexCheck ? codexCheck.installed : false}
-              statusRunning={status.running}
+              waitingForReply={waitingForReply}
+              streamingText={streamingText}
+              replyHint={replyHint}
               sessionMode={sessionMode}
               onSessionModeChange={setSessionMode}
               onSend={sendPrompt}
