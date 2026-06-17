@@ -4,22 +4,41 @@ import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 // NOTE: rehype-highlight is expensive for long timelines; keep rendering lightweight.
 import {
-  ArrowUp,
+  FALLBACK_MODELS,
+  parseModelsFromList,
+  type ModelOption,
+} from './modelPicker';
+import { buildTurnInput, ChatComposer, type ComposerAttachment, type ComposerSubmitPayload } from './chatComposer';
+import { ProjectContextMenu, type ProjectContextMenuState, type ProjectMenuTarget } from './projectContextMenu';
+import {
+  detectPermissionMode,
+  permissionModeToSettings,
+  type PermissionModeId,
+} from './permissionsPicker';
+import {
+  isThreadRenderable,
+  mergeToolCompleted,
+  mergeToolStarted,
+  ThreadTimelineView,
+  ThinkingShimmer,
+  timelineFromThreadRead,
+  type TimelineItem,
+} from './threadTimeline';
+import {
   CalendarClock,
-  CheckCircle2,
-  CircleStop,
+  ChevronDown,
+  ChevronRight,
   FolderOpen,
   FolderPlus,
-  Loader2,
   MessageSquareText,
+  MoreHorizontal,
+  Pin,
   Plus,
-  Play,
   Puzzle,
   Search,
   Settings,
-  ShieldCheck,
-  Sparkles,
-  Workflow,
+  SquarePen,
+  Trash2,
 } from 'lucide-react';
 
 type CodexStatus = {
@@ -51,97 +70,11 @@ type RpcEnvelope = {
   params?: unknown;
 };
 
-type TimelineItem = {
-  id: string;
-  kind: 'agent' | 'user' | 'tool' | 'system' | 'error' | 'approval';
-  title: string;
-  body: string;
-  subtype?: string;
-  turnIndex?: number;
-};
+const APP_NAME = '鱼泡codex';
 
-function isChatMessage(event: TimelineItem) {
-  return event.kind === 'agent' || event.kind === 'user';
-}
-
-const MarkdownBlock = React.memo(function MarkdownBlock({ value }: { value: string }) {
-  return <pre className="event-mono">{value}</pre>;
-});
-
-type ChatComposerProps = {
-  busy: boolean;
-  waitingForReply: boolean;
-  streamingText: string;
-  replyHint: string | null;
-  sessionMode: SessionMode;
-  onSessionModeChange: (mode: SessionMode) => void;
-  onSend: (text: string) => void | Promise<void>;
-  onNewThread: () => void;
-};
-
-const ChatComposer = React.memo(function ChatComposer({
-  busy,
-  waitingForReply,
-  streamingText,
-  replyHint,
-  sessionMode,
-  onSessionModeChange,
-  onSend,
-  onNewThread,
-}: ChatComposerProps) {
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const sending = busy || waitingForReply;
-
-  const submit = async () => {
-    const text = (inputRef.current?.value ?? '').trim();
-    if (!text || sending) return;
-    if (inputRef.current) inputRef.current.value = '';
-    await onSend(text);
-  };
-
-  return (
-    <div className="composer enterprise-composer">
-      <button className="plus-button" onClick={onNewThread} disabled={sending}>
-        <Plus size={18} />
-      </button>
-      <textarea
-        ref={inputRef}
-        rows={3}
-        placeholder="输入任务，例如：检查 MCP 和 Skill 状态，并继续当前会话。"
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && !event.shiftKey) {
-            event.preventDefault();
-            void submit();
-          }
-        }}
-      />
-      <div className="composer-meta">
-        <div className="session-mode-toggle">
-          <button
-            className={sessionMode === 'local' ? 'mode-btn active' : 'mode-btn'}
-            onClick={() => onSessionModeChange('local')}
-            type="button"
-          >
-            Local
-          </button>
-          <button
-            className={sessionMode === 'worktree' ? 'mode-btn active' : 'mode-btn'}
-            onClick={() => onSessionModeChange('worktree')}
-            type="button"
-          >
-            Worktree
-          </button>
-        </div>
-        {waitingForReply || streamingText ? (
-          <span className="composer-status thinking">{streamingText || replyHint || '思考中…'}</span>
-        ) : null}
-        <button className="send-button" onClick={() => void submit()} disabled={sending}>
-          {sending ? <Loader2 size={17} className="spin" /> : <ArrowUp size={17} />}
-        </button>
-      </div>
-    </div>
-  );
-});
+const MODEL_PREF_KEY = 'codex-tauri.model';
+const EFFORT_PREF_KEY = 'codex-tauri.effort';
+const PERMISSION_PREF_KEY = 'codex-tauri.permission-mode';
 
 type AppServerItem = {
   id?: string;
@@ -241,6 +174,7 @@ type Project = {
   path: string;
   name: string;
   created_at: number;
+  pinned?: boolean;
 };
 
 type SessionRow = {
@@ -252,6 +186,7 @@ type SessionRow = {
   title?: string | null;
   updated_at?: number | null;
   status?: string | null;
+  pinned?: boolean;
 };
 
 type CodexCheckResult = {
@@ -272,22 +207,17 @@ type ThreadSettingsView = {
   cwd?: string;
   model?: string;
   modelProvider?: string;
-  approvalPolicy?: string;
+  approvalPolicy?: string | Record<string, unknown>;
   approvalsReviewer?: string;
+  sandboxPolicy?: { type?: string };
   collaborationMode?: string;
   serviceTier?: string | null;
+  effort?: string;
 };
 
-const defaultProject = '/Users/black/IdeaProjects/vibeCoding/codex-tauri-client';
 const isTauriRuntime = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-const autoConnectMessage = '正在连接企业研发助手，连接完成后可直接发送任务。';
-
-const staticConversations: Conversation[] = [
-  { id: 'local-design', title: 'Codex 企业客户端设计', updated: '刚刚', unread: true, status: '规划' },
-  { id: 'mcp-skill', title: 'MCP 与 Skill 保障链路', updated: '19 小时', status: '治理' },
-  { id: 'history-demo', title: '历史会话与项目分组', updated: '1 天', status: '本地' },
-  { id: 'review-pane', title: '评审面板与审批流', updated: '2 天', status: '待实现' },
-];
+const autoConnectMessage = `正在连接${APP_NAME}，连接完成后可直接发送任务。`;
+const addProjectHint = '点击左侧项目区域的「+」添加文件夹后，再开始新对话。';
 
 function toPretty(value: unknown) {
   if (value == null) return '';
@@ -301,9 +231,102 @@ function getPayloadArray(value: unknown): unknown[] {
   return Array.isArray(payload.data) ? payload.data : [];
 }
 
-function formatTime(seconds?: number) {
-  if (!seconds) return '未知';
+const SERVER_APPROVAL_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/tool/requestUserInput',
+  'mcpServer/elicitation/request',
+  'item/permissions/requestApproval',
+  'item/tool/call',
+  'account/chatgptAuthTokens/refresh',
+  'attestation/generate',
+  'applyPatchApproval',
+  'execCommandApproval',
+]);
+
+const SILENT_TIMELINE_METHODS = new Set([
+  'thread/list',
+  'thread/resume',
+  'thread/read',
+  'skills/list',
+  'mcpServerStatus/list',
+  'model/list',
+  'initialize',
+  'thread/settings/update',
+]);
+
+const SILENT_NOTIFICATION_METHODS = new Set([
+  'thread/started',
+  'thread/status/changed',
+  'thread/name/updated',
+  'thread/tokenUsage/updated',
+  'skills/changed',
+]);
+
+function isServerApprovalRequest(method: string | undefined): method is string {
+  return typeof method === 'string' && SERVER_APPROVAL_METHODS.has(method);
+}
+
+function shouldAppendEnvelopeToTimeline(envelope: RpcEnvelope): boolean {
+  const method = envelope.method;
+  const requestMethod = envelope.request_method;
+  if (envelope.error && requestMethod) return true;
+  if (method) {
+    if (SILENT_NOTIFICATION_METHODS.has(method)) return false;
+    if (method.startsWith('item/')) return false;
+    if (method.startsWith('turn/')) return false;
+    if (method.startsWith('thread/')) return false;
+    if (method.startsWith('command/')) return false;
+    if (method.startsWith('skills/')) return false;
+    if (method.startsWith('mcpServer')) return false;
+  }
+  const key = requestMethod ?? '';
+  if (SILENT_TIMELINE_METHODS.has(key)) return false;
+  if (
+    key.startsWith('thread/') ||
+    key.startsWith('turn/') ||
+    key.startsWith('skills/') ||
+    key.startsWith('mcpServer') ||
+    key.startsWith('model/')
+  ) {
+    return false;
+  }
+  if (isServerApprovalRequest(method)) return false;
+  return false;
+}
+
+function sandboxModeForThreadStart(sandboxPolicy: Record<string, unknown> | undefined): string | null {
+  const type = sandboxPolicy?.type;
+  if (type === 'dangerFullAccess') return 'danger-full-access';
+  if (type === 'workspaceWrite') return 'workspace-write';
+  if (type === 'readOnly') return 'read-only';
+  return null;
+}
+
+function threadStartPermissionArgs(mode: PermissionModeId, cwd: string | null) {
+  const settings = permissionModeToSettings(mode, cwd);
+  if (!settings) return {};
+  return {
+    approvalPolicy: settings.approvalPolicy,
+    approvalsReviewer: settings.approvalsReviewer,
+    sandbox: sandboxModeForThreadStart(settings.sandboxPolicy),
+  };
+}
+
+async function applyThreadPermissionSettings(threadId: string, mode: PermissionModeId, cwd: string | null) {
+  const settings = permissionModeToSettings(mode, cwd);
+  if (!settings) return;
+  try {
+    await invoke('codex_update_thread_settings', { threadId, threadSettings: settings });
+  } catch {
+    // turn/start overrides still apply when thread settings update is unavailable
+  }
+}
+
+function formatTime(seconds?: number | null) {
+  if (!seconds) return '';
   const diff = Math.max(0, Date.now() / 1000 - seconds);
+  if (diff < 60) return '刚刚';
   if (diff < 3600) return `${Math.max(1, Math.floor(diff / 60))} 分钟`;
   if (diff < 86400) return `${Math.floor(diff / 3600)} 小时`;
   return `${Math.floor(diff / 86400)} 天`;
@@ -319,7 +342,7 @@ function classifyEnvelope(envelope: RpcEnvelope): TimelineItem {
       body: toPretty(envelope.error),
     };
   }
-  if (envelope.method && envelope.id && envelope.params && !envelope.result) {
+  if (isServerApprovalRequest(envelope.method) && envelope.id && envelope.params && !envelope.result) {
     return {
       id: crypto.randomUUID(),
       kind: 'approval',
@@ -485,6 +508,20 @@ function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }
 
+function formatSessionTitle(text: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '新会话';
+  if (normalized.length <= 15) return normalized;
+  return `${normalized.slice(0, 15)}...`;
+}
+
+function sessionTitleFromInput(text: string, attachments: ComposerAttachment[]): string {
+  const trimmed = text.trim();
+  if (trimmed) return formatSessionTitle(trimmed);
+  if (attachments.length > 0) return formatSessionTitle('图片消息');
+  return '新会话';
+}
+
 function encodeBase64Utf8(value: string) {
   const bytes = new TextEncoder().encode(value);
   let binary = '';
@@ -542,15 +579,23 @@ function extractThreadSettings(result: unknown): ThreadSettingsView | null {
     cwd: typeof settings.cwd === 'string' ? settings.cwd : undefined,
     model: typeof settings.model === 'string' ? settings.model : undefined,
     modelProvider: typeof settings.modelProvider === 'string' ? settings.modelProvider : undefined,
-    approvalPolicy: typeof settings.approvalPolicy === 'string' ? settings.approvalPolicy : undefined,
+    approvalPolicy:
+      typeof settings.approvalPolicy === 'string' || (settings.approvalPolicy && typeof settings.approvalPolicy === 'object')
+        ? settings.approvalPolicy
+        : undefined,
     approvalsReviewer:
       typeof settings.approvalsReviewer === 'string'
         ? settings.approvalsReviewer
         : settings.approvalsReviewer
         ? String(settings.approvalsReviewer)
         : undefined,
+    sandboxPolicy:
+      settings.sandboxPolicy && typeof settings.sandboxPolicy === 'object'
+        ? { type: typeof settings.sandboxPolicy.type === 'string' ? settings.sandboxPolicy.type : undefined }
+        : undefined,
     collaborationMode: typeof settings.collaborationMode === 'string' ? settings.collaborationMode : undefined,
     serviceTier: typeof settings.serviceTier === 'string' ? settings.serviceTier : null,
+    effort: typeof settings.effort === 'string' ? settings.effort : undefined,
   };
 }
 
@@ -563,64 +608,39 @@ function normalizeThreadSettings(params: unknown): ThreadSettingsView | null {
     cwd: typeof settings.cwd === 'string' ? settings.cwd : undefined,
     model: typeof settings.model === 'string' ? settings.model : undefined,
     modelProvider: typeof settings.modelProvider === 'string' ? settings.modelProvider : undefined,
-    approvalPolicy: typeof settings.approvalPolicy === 'string' ? settings.approvalPolicy : undefined,
+    approvalPolicy:
+      typeof settings.approvalPolicy === 'string' || (settings.approvalPolicy && typeof settings.approvalPolicy === 'object')
+        ? settings.approvalPolicy
+        : undefined,
     approvalsReviewer:
       typeof settings.approvalsReviewer === 'string'
         ? settings.approvalsReviewer
         : settings.approvalsReviewer
         ? String(settings.approvalsReviewer)
         : undefined,
+    sandboxPolicy:
+      settings.sandboxPolicy && typeof settings.sandboxPolicy === 'object'
+        ? { type: typeof settings.sandboxPolicy.type === 'string' ? settings.sandboxPolicy.type : undefined }
+        : undefined,
     collaborationMode: typeof settings.collaborationMode === 'string' ? settings.collaborationMode : undefined,
     serviceTier: typeof settings.serviceTier === 'string' ? settings.serviceTier : null,
+    effort: typeof settings.effort === 'string' ? settings.effort : undefined,
   };
 }
 
-function timelineFromThreadRead(result: unknown): TimelineItem[] {
+function latestAgentFromCurrentTurn(result: unknown): string | null {
   const thread = (result as any)?.thread ?? (result as any);
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-  const items: TimelineItem[] = [];
-
-  let idx = 0;
-  for (const turn of turns) {
-    idx += 1;
-    const turnItems = Array.isArray(turn?.items) ? turn.items : [];
-    for (const item of turnItems) {
-      const type = item?.type as string | undefined;
-      if (type === 'userMessage') {
-        const content = Array.isArray(item?.content) ? item.content : [];
-        const text = content
-          .filter((c: any) => c?.type === 'text' && typeof c?.text === 'string')
-          .map((c: any) => c.text)
-          .join('\n');
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'user',
-          title: '用户',
-          body: text || toPretty(item),
-          turnIndex: idx,
-        });
-        continue;
-      }
-      if (type === 'agentMessage') {
-        items.push({
-          id: crypto.randomUUID(),
-          kind: 'agent',
-          title: '助手',
-          body: typeof item?.text === 'string' ? item.text : toPretty(item),
-          turnIndex: idx,
-        });
-      }
-    }
+  const lastTurn = turns[turns.length - 1];
+  if (!lastTurn) return null;
+  const turnItems = Array.isArray(lastTurn.items) ? lastTurn.items : [];
+  for (let i = turnItems.length - 1; i >= 0; i -= 1) {
+    const item = turnItems[i];
+    if (item?.type !== 'agentMessage') continue;
+    const text = typeof item.text === 'string' ? item.text.trim() : '';
+    if (text) return text;
   }
-
-  return items;
-}
-
-function latestAgentFromThreadRead(result: unknown): string | null {
-  const msgs = timelineFromThreadRead(result);
-  const latestAgent = [...msgs].reverse().find((m) => m.kind === 'agent');
-  const body = latestAgent?.body?.trim();
-  return body ? body : null;
+  return null;
 }
 
 function isLatestTurnFinished(result: unknown): boolean {
@@ -633,14 +653,15 @@ function isLatestTurnFinished(result: unknown): boolean {
 
 export default function App() {
   const [status, setStatus] = useState<CodexStatus>({ running: false, initialized: false, transport: 'stdio-jsonl' });
-  const [projectPath, setProjectPath] = useState(defaultProject);
+  const [projectPath, setProjectPath] = useState('');
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [codexCheck, setCodexCheck] = useState<CodexCheckResult | null>(null);
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
-  const [conversations, setConversations] = useState<Conversation[]>(staticConversations);
+  const [turnTiming, setTurnTiming] = useState<Record<number, { startedAt: number; completedAt?: number }>>({});
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [skills, setSkills] = useState<InventoryItem[]>([]);
   const [mcpServers, setMcpServers] = useState<InventoryItem[]>([]);
@@ -690,21 +711,40 @@ export default function App() {
   const [quickModel, setQuickModel] = useState('');
   const [quickApproval, setQuickApproval] = useState('');
   const [quickSandbox, setQuickSandbox] = useState('');
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>(FALLBACK_MODELS);
+  const [selectedModel, setSelectedModel] = useState(
+    () => localStorage.getItem(MODEL_PREF_KEY) || FALLBACK_MODELS[0].model,
+  );
+  const [selectedEffort, setSelectedEffort] = useState(
+    () => localStorage.getItem(EFFORT_PREF_KEY) || 'high',
+  );
+  const [permissionMode, setPermissionMode] = useState<PermissionModeId>(
+    () => (localStorage.getItem(PERMISSION_PREF_KEY) as PermissionModeId) || 'full-access',
+  );
+  const [planMode, setPlanMode] = useState(false);
+  const [goalMode, setGoalMode] = useState(false);
+  const selectedModelRef = useRef(selectedModel);
+  const selectedEffortRef = useRef(selectedEffort);
+  const permissionModeRef = useRef(permissionMode);
   const [sessionMode, setSessionMode] = useState<SessionMode>('local');
   const pendingPromptRef = useRef<string | null>(null);
   const bootstrappedRef = useRef(false);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
   const pendingCreateSessionProjectIdRef = useRef<number | null>(null);
   const pendingSessionModeRef = useRef<SessionMode>('local');
+  const pendingSessionTitleRef = useRef<string | null>(null);
   const threadIdRef = useRef<string | null>(null);
   const threadWarmupRef = useRef<Promise<string | null> | null>(null);
+  const draftSessionRef = useRef(true);
+  const sessionHydrateRef = useRef(false);
   const waitingForReplyRef = useRef(false);
   const streamingTextRef = useRef('');
   const threadReadPollRef = useRef<number | null>(null);
   const replyPollTokenRef = useRef<string | null>(null);
   const selectedProjectIdRef = useRef<number | null>(null);
-  const projectPathRef = useRef(defaultProject);
+  const projectPathRef = useRef('');
   const projectsRef = useRef<Project[]>([]);
+  const sessionsRef = useRef<SessionRow[]>([]);
   const streamingAgentRef = useRef<{ itemId: string; timelineId: string } | null>(null);
   const streamingToolRef = useRef<Map<string, string>>(new Map());
   const latestDiffTimelineIdRef = useRef<string | null>(null);
@@ -718,6 +758,9 @@ export default function App() {
   const [turnState, setTurnState] = useState<'idle' | 'thinking' | 'runningTools'>('idle');
   const [editingProjectId, setEditingProjectId] = useState<number | null>(null);
   const [editingProjectName, setEditingProjectName] = useState('');
+  const [sessionsListExpanded, setSessionsListExpanded] = useState(false);
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Set<number>>(() => new Set());
+  const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState | null>(null);
 
   const commitAgentReplyRef = useRef<(body: string, finalize?: boolean) => void>(() => {});
   commitAgentReplyRef.current = (body: string, finalize = false) => {
@@ -729,18 +772,30 @@ export default function App() {
       if (stream) {
         const exists = current.some((evt) => evt.id === stream.timelineId);
         if (exists) {
-          return current.map((evt) => (evt.id === stream.timelineId ? { ...evt, body: text } : evt));
+          return current.map((evt) =>
+            evt.id === stream.timelineId ? { ...evt, body: text, completed: true } : evt,
+          );
         }
         return [
           ...current,
-          { id: stream.timelineId, kind: 'agent' as const, title: '助手', body: text, turnIndex: turnIndexRef.current },
+          {
+            id: stream.timelineId,
+            kind: 'agent' as const,
+            title: '助手',
+            body: text,
+            turnIndex: turnIndexRef.current,
+            completed: true,
+          },
         ];
       }
       const duplicate = current.some((item) => item.kind === 'agent' && item.body === text);
       if (duplicate) return current;
       const id = crypto.randomUUID();
       streamingAgentRef.current = { itemId: id, timelineId: id };
-      return [...current, { id, kind: 'agent' as const, title: '助手', body: text, turnIndex: turnIndexRef.current }];
+      return [
+        ...current,
+        { id, kind: 'agent' as const, title: '助手', body: text, turnIndex: turnIndexRef.current, completed: true },
+      ];
     });
     if (finalize) {
       streamingAgentRef.current = null;
@@ -759,7 +814,7 @@ export default function App() {
       if (replyPollTokenRef.current !== pollToken || !waitingForReplyRef.current) return;
       try {
         const result = await invoke<unknown>('codex_read_thread_sync', { threadId, includeTurns: true });
-        const agentText = latestAgentFromThreadRead(result);
+        const agentText = latestAgentFromCurrentTurn(result);
         if (agentText) {
           commitAgentReplyRef.current(agentText, isLatestTurnFinished(result));
           if (isLatestTurnFinished(result)) return;
@@ -767,6 +822,90 @@ export default function App() {
       } catch {
         // ignore transient read failures while the turn is still running
       }
+    }
+  }
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+
+  useEffect(() => {
+    selectedEffortRef.current = selectedEffort;
+  }, [selectedEffort]);
+
+  useEffect(() => {
+    permissionModeRef.current = permissionMode;
+  }, [permissionMode]);
+
+  useEffect(() => {
+    if (threadSettingsView) {
+      setPermissionMode(
+        detectPermissionMode({
+          approvalPolicy: threadSettingsView.approvalPolicy,
+          approvalsReviewer: threadSettingsView.approvalsReviewer,
+          sandboxPolicy: threadSettingsView.sandboxPolicy,
+        }),
+      );
+    }
+    if (threadSettingsView?.model) setSelectedModel(threadSettingsView.model);
+    if (threadSettingsView?.effort) setSelectedEffort(threadSettingsView.effort);
+  }, [
+    threadSettingsView?.approvalPolicy,
+    threadSettingsView?.approvalsReviewer,
+    threadSettingsView?.sandboxPolicy,
+    threadSettingsView?.model,
+    threadSettingsView?.effort,
+  ]);
+
+  useEffect(() => {
+    localStorage.setItem(MODEL_PREF_KEY, selectedModel);
+  }, [selectedModel]);
+
+  useEffect(() => {
+    localStorage.setItem(EFFORT_PREF_KEY, selectedEffort);
+  }, [selectedEffort]);
+
+  useEffect(() => {
+    localStorage.setItem(PERMISSION_PREF_KEY, permissionMode);
+  }, [permissionMode]);
+
+  async function refreshModelCatalog() {
+    if (!isTauriRuntime) return;
+    try {
+      const result = await invoke<unknown>('codex_list_models_sync');
+      const next = parseModelsFromList(result);
+      setModelOptions(next);
+      if (!next.some((item) => item.model === selectedModelRef.current)) {
+        const fallback = next[0];
+        if (fallback) setSelectedModel(fallback.model);
+      }
+    } catch {
+      setModelOptions(FALLBACK_MODELS);
+    }
+  }
+
+  function handleModelChange(model: string) {
+    setSelectedModel(model);
+    setQuickModel(model);
+  }
+
+  function handleEffortChange(effort: string) {
+    setSelectedEffort(effort);
+  }
+
+  async function handlePermissionModeChange(mode: PermissionModeId) {
+    setPermissionMode(mode);
+    const settings = permissionModeToSettings(mode, projectPathRef.current || projectPath || null);
+    if (!settings) return;
+    const activeThreadId = threadIdRef.current;
+    if (!activeThreadId || !isTauriRuntime) return;
+    try {
+      await invoke('codex_update_thread_settings', {
+        threadId: activeThreadId,
+        threadSettings: settings,
+      });
+    } catch {
+      // Fall back to turn/start overrides when thread settings update is unavailable.
     }
   }
 
@@ -785,6 +924,10 @@ export default function App() {
   useEffect(() => {
     projectsRef.current = projects;
   }, [projects]);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
   useEffect(() => {
     execProcessIdRef.current = execProcessId;
@@ -845,7 +988,7 @@ export default function App() {
       if (!tid || !waitingForReplyRef.current) return;
       invoke<unknown>('codex_read_thread_sync', { threadId: tid, includeTurns: true })
         .then((result) => {
-          const agentText = latestAgentFromThreadRead(result);
+          const agentText = latestAgentFromCurrentTurn(result);
           if (agentText) {
             commitAgentReplyRef.current(agentText, isLatestTurnFinished(result));
           }
@@ -889,21 +1032,23 @@ export default function App() {
 
     invoke<Project[]>('projects_list')
       .then(async (rows) => {
+        setProjects(rows);
         if (rows.length === 0) {
-          const seeded = await invoke<Project>('project_add', { path: defaultProject, name: null, now: nowSeconds() });
-          setProjects([seeded]);
-          setSelectedProjectId(seeded.id);
-          setProjectPath(seeded.path);
-          const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: seeded.id });
-          setSessions(nextSessions);
-        } else {
-          setProjects(rows);
-          const first = rows[0];
-          setSelectedProjectId(first.id);
-          setProjectPath(first.path);
-          const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: first.id });
-          setSessions(nextSessions);
+          setSelectedProjectId(null);
+          selectedProjectIdRef.current = null;
+          setProjectPath('');
+          projectPathRef.current = '';
+          setSessions([]);
+          return;
         }
+        const first = rows[0];
+        setSelectedProjectId(first.id);
+        selectedProjectIdRef.current = first.id;
+        setProjectPath(first.path);
+        projectPathRef.current = first.path;
+        setExpandedProjectIds(new Set([first.id]));
+        const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: first.id });
+        setSessions(nextSessions);
       })
       .catch((error) => {
         setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'error', title: '读取项目列表失败', body: String(error) }]);
@@ -919,7 +1064,7 @@ export default function App() {
       let skipAppend = false;
 
       const approvalMethod = envelope.method;
-      if (approvalMethod && envelope.id !== undefined && envelope.params && !envelope.result && !envelope.error) {
+      if (isServerApprovalRequest(approvalMethod) && envelope.id !== undefined && envelope.params && !envelope.result && !envelope.error) {
         const approvalId = envelope.id;
         setPendingApprovals((current) => [
           ...current.filter((approval) => approval.id !== approvalId),
@@ -930,12 +1075,12 @@ export default function App() {
       if (method === 'turn/started') {
         setTurnIndex((prev) => {
           const next = prev + 1;
-          setTimeline((current) => [
-            ...current,
-            { id: crypto.randomUUID(), kind: 'system', subtype: 'turn', title: `第 ${next} 轮`, body: '思考中…', turnIndex: next },
-          ]);
+          setTurnTiming((current) => ({ ...current, [next]: { startedAt: Date.now() } }));
           return next;
         });
+        setStreamingText('');
+        streamingAgentRef.current = null;
+        streamingToolRef.current.clear();
         setTurnState('thinking');
         setWaitingForReply(true);
         return;
@@ -954,11 +1099,31 @@ export default function App() {
         const params = envelope.params as { itemId?: string; delta?: string };
         const delta = params.delta ?? '';
         if (delta) {
-          if (!streamingAgentRef.current) {
-            const id = crypto.randomUUID();
-            streamingAgentRef.current = { itemId: params.itemId ?? id, timelineId: id };
+          const itemId = params.itemId ?? '';
+          const stream = streamingAgentRef.current;
+          if (!stream || (itemId && stream.itemId !== itemId)) {
+            const timelineId = crypto.randomUUID();
+            streamingAgentRef.current = { itemId: itemId || timelineId, timelineId };
+            setStreamingText(delta);
+            setTimeline((current) => [
+              ...current,
+              {
+                id: timelineId,
+                kind: 'agent',
+                title: '助手',
+                body: delta,
+                turnIndex: turnIndexRef.current,
+                completed: false,
+              },
+            ]);
+          } else {
+            setStreamingText((prev) => prev + delta);
+            setTimeline((current) =>
+              current.map((evt) =>
+                evt.id === stream.timelineId ? { ...evt, body: evt.body + delta, completed: false } : evt,
+              ),
+            );
           }
-          setStreamingText((prev) => prev + delta);
         }
         return;
       }
@@ -1003,7 +1168,7 @@ export default function App() {
             }
             const timelineId = crypto.randomUUID();
             streamingToolRef.current.set(itemId, timelineId);
-            return [...current, { id: timelineId, kind: 'tool', subtype: 'plan', title: '计划', body: delta }];
+            return [...current, { id: timelineId, kind: 'tool', subtype: 'plan', title: '计划', body: delta, turnIndex: turnIndexRef.current, completed: false, ...mergeToolStarted() }];
           });
         }
         return;
@@ -1032,9 +1197,12 @@ export default function App() {
                   id: timelineId,
                   kind: 'tool',
                   subtype: 'commandExecution',
-                  title: `命令：${typeof item.command === 'string' ? item.command : 'command'}`,
+                  title: '命令',
+                  command: typeof item.command === 'string' ? item.command : 'command',
                   body: '',
                   turnIndex: turnIndexRef.current,
+                  completed: false,
+                  ...mergeToolStarted(),
                 },
               ]);
               return;
@@ -1043,7 +1211,18 @@ export default function App() {
               const output = typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput : '';
               const tid = streamingToolRef.current.get(itemId);
               if (tid) {
-                setTimeline((current) => current.map((evt) => (evt.id === tid ? { ...evt, body: output || evt.body || toPretty(item) } : evt)));
+                setTimeline((current) =>
+                  current.map((evt) =>
+                    evt.id === tid
+                      ? {
+                          ...evt,
+                          body: output || evt.body || toPretty(item),
+                          completed: true,
+                          ...mergeToolCompleted(item as Record<string, unknown>, evt),
+                        }
+                      : evt,
+                  ),
+                );
               } else {
                 setTimeline((current) => [
                   ...current,
@@ -1051,8 +1230,122 @@ export default function App() {
                     id: crypto.randomUUID(),
                     kind: 'tool',
                     subtype: 'commandExecution',
-                    title: `命令：${typeof item.command === 'string' ? item.command : 'command'}`,
+                    title: '命令',
+                    command: typeof item.command === 'string' ? item.command : 'command',
                     body: output || toPretty(item),
+                    completed: true,
+                    ...mergeToolCompleted(item as Record<string, unknown>),
+                  },
+                ]);
+              }
+              streamingToolRef.current.delete(itemId);
+              return;
+            }
+          }
+
+          if (item.type === 'reasoning') {
+            if (method === 'item/started') {
+              setTurnState('thinking');
+              const timelineId = crypto.randomUUID();
+              streamingToolRef.current.set(itemId, timelineId);
+              setTimeline((current) => [
+                ...current,
+                {
+                  id: timelineId,
+                  kind: 'tool',
+                  subtype: 'reasoning',
+                  title: '思考',
+                  body: '',
+                  turnIndex: turnIndexRef.current,
+                  completed: false,
+                  ...mergeToolStarted(),
+                },
+              ]);
+              return;
+            }
+            if (method === 'item/completed') {
+              const summary = Array.isArray(item.summary)
+                ? item.summary.filter((s: unknown) => typeof s === 'string').join('\n\n')
+                : '';
+              const tid = streamingToolRef.current.get(itemId);
+              if (tid) {
+                setTimeline((current) =>
+                  current.map((evt) =>
+                    evt.id === tid
+                      ? {
+                          ...evt,
+                          body: summary || evt.body,
+                          completed: true,
+                          ...mergeToolCompleted(item as Record<string, unknown>, evt),
+                        }
+                      : evt,
+                  ),
+                );
+              } else if (summary) {
+                setTimeline((current) => [
+                  ...current,
+                  {
+                    id: crypto.randomUUID(),
+                    kind: 'tool',
+                    subtype: 'reasoning',
+                    title: '思考',
+                    body: summary,
+                    turnIndex: turnIndexRef.current,
+                    completed: true,
+                  },
+                ]);
+              }
+              streamingToolRef.current.delete(itemId);
+              return;
+            }
+          }
+
+          if (item.type === 'plan') {
+            if (method === 'item/started') {
+              const timelineId = crypto.randomUUID();
+              streamingToolRef.current.set(itemId, timelineId);
+              setTimeline((current) => [
+                ...current,
+                {
+                  id: timelineId,
+                  kind: 'tool',
+                  subtype: 'plan',
+                  title: '计划',
+                  body: typeof item.text === 'string' ? item.text : '',
+                  turnIndex: turnIndexRef.current,
+                  completed: false,
+                  ...mergeToolStarted(),
+                },
+              ]);
+              return;
+            }
+            if (method === 'item/completed') {
+              const text = typeof item.text === 'string' ? item.text : '';
+              const tid = streamingToolRef.current.get(itemId);
+              if (tid) {
+                setTimeline((current) =>
+                  current.map((evt) =>
+                    evt.id === tid
+                      ? {
+                          ...evt,
+                          body: text || evt.body,
+                          completed: true,
+                          ...mergeToolCompleted(item as Record<string, unknown>, evt),
+                        }
+                      : evt,
+                  ),
+                );
+              } else if (text) {
+                setTimeline((current) => [
+                  ...current,
+                  {
+                    id: crypto.randomUUID(),
+                    kind: 'tool',
+                    subtype: 'plan',
+                    title: '计划',
+                    body: text,
+                    turnIndex: turnIndexRef.current,
+                    completed: true,
                   },
                 ]);
               }
@@ -1086,7 +1379,7 @@ export default function App() {
               const args = item.arguments ? `arguments:\n${toPretty(item.arguments)}\n` : '';
               setTimeline((current) => [
                 ...current,
-                { id: timelineId, kind: 'tool', subtype: 'mcpToolCall', title: `MCP：${server}/${tool}`, body: args, turnIndex: turnIndexRef.current },
+                { id: timelineId, kind: 'tool', subtype: 'mcpToolCall', title: `MCP：${server}/${tool}`, command: `${server}/${tool}`, body: args, turnIndex: turnIndexRef.current, completed: false, ...mergeToolStarted() },
               ]);
               return;
             }
@@ -1099,7 +1392,19 @@ export default function App() {
               const body = `${args}${result}`.trim() || toPretty(item);
               const tid = streamingToolRef.current.get(itemId);
               if (tid) {
-                setTimeline((current) => current.map((evt) => (evt.id === tid ? { ...evt, title: `MCP：${server}/${tool}${statusText}`, body } : evt)));
+                setTimeline((current) =>
+                  current.map((evt) =>
+                    evt.id === tid
+                      ? {
+                          ...evt,
+                          title: `MCP：${server}/${tool}${statusText}`,
+                          body,
+                          completed: true,
+                          ...mergeToolCompleted(item as Record<string, unknown>, evt),
+                        }
+                      : evt,
+                  ),
+                );
               } else {
                 setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'tool', subtype: 'mcpToolCall', title: `MCP：${server}/${tool}${statusText}`, body }]);
               }
@@ -1117,7 +1422,7 @@ export default function App() {
               const args = item.arguments ? `arguments:\n${toPretty(item.arguments)}\n` : '';
               setTimeline((current) => [
                 ...current,
-                { id: timelineId, kind: 'tool', subtype: 'dynamicToolCall', title: `动态工具：${tool}`, body: args, turnIndex: turnIndexRef.current },
+                { id: timelineId, kind: 'tool', subtype: 'dynamicToolCall', title: `动态工具：${tool}`, command: tool, body: args, turnIndex: turnIndexRef.current, completed: false, ...mergeToolStarted() },
               ]);
               return;
             }
@@ -1131,15 +1436,65 @@ export default function App() {
               const body = `${args}${success}${contentItems}${error}`.trim() || toPretty(item);
               const tid = streamingToolRef.current.get(itemId);
               if (tid) {
-                setTimeline((current) => current.map((evt) => (evt.id === tid ? { ...evt, title: `动态工具：${tool}${statusText}`, body } : evt)));
+                setTimeline((current) =>
+                  current.map((evt) =>
+                    evt.id === tid
+                      ? {
+                          ...evt,
+                          title: `动态工具：${tool}${statusText}`,
+                          body,
+                          completed: true,
+                          ...mergeToolCompleted(item as Record<string, unknown>, evt),
+                        }
+                      : evt,
+                  ),
+                );
               } else {
-                setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'tool', subtype: 'dynamicToolCall', title: `动态工具：${tool}${statusText}`, body }]);
+                setTimeline((current) => [
+                  ...current,
+                  {
+                    id: crypto.randomUUID(),
+                    kind: 'tool',
+                    subtype: 'dynamicToolCall',
+                    title: `动态工具：${tool}${statusText}`,
+                    body,
+                    completed: true,
+                    ...mergeToolCompleted(item as Record<string, unknown>),
+                  },
+                ]);
               }
               streamingToolRef.current.delete(itemId);
               return;
             }
           }
         }
+      }
+
+      if (method === 'turn/plan/updated' && envelope.params) {
+        const params = envelope.params as {
+          explanation?: string | null;
+          plan?: Array<{ step?: string; status?: string }>;
+        };
+        const steps = (params.plan ?? [])
+          .map((step) => `- [${step.status ?? 'pending'}] ${step.step ?? ''}`.trim())
+          .filter(Boolean)
+          .join('\n');
+        const body = [params.explanation ?? '', steps].filter(Boolean).join('\n\n');
+        if (body) {
+          setTimeline((current) => [
+            ...current,
+            {
+              id: crypto.randomUUID(),
+              kind: 'tool',
+              subtype: 'todoList',
+              title: '任务计划',
+              body,
+              turnIndex: turnIndexRef.current,
+              completed: true,
+            },
+          ]);
+        }
+        return;
       }
 
       if (method === 'turn/diff/updated' && envelope.params) {
@@ -1167,7 +1522,7 @@ export default function App() {
           const key = `reasoning:${itemId}:${params.summaryIndex ?? 0}`;
           const timelineId = crypto.randomUUID();
           streamingToolRef.current.set(key, timelineId);
-          setTimeline((current) => [...current, { id: timelineId, kind: 'tool', subtype: 'reasoning', title: '推理摘要', body: '' }]);
+          setTimeline((current) => [...current, { id: timelineId, kind: 'tool', subtype: 'reasoning', title: '思考', body: '', turnIndex: turnIndexRef.current, completed: false, ...mergeToolStarted() }]);
         }
         return;
       }
@@ -1180,33 +1535,40 @@ export default function App() {
           const key = `reasoning:${itemId}:${params.summaryIndex ?? 0}`;
           setTimeline((current) => {
             const timelineId = streamingToolRef.current.get(key);
-            if (!timelineId) return [...current, { id: crypto.randomUUID(), kind: 'tool', subtype: 'reasoning', title: '推理摘要', body: delta }];
-            return current.map((evt) => (evt.id === timelineId ? { ...evt, body: evt.body + delta } : evt));
+            if (!timelineId) {
+              return [
+                ...current,
+                {
+                  id: crypto.randomUUID(),
+                  kind: 'tool',
+                  subtype: 'reasoning',
+                  title: '思考',
+                  body: delta,
+                  turnIndex: turnIndexRef.current,
+                  completed: false,
+                  ...mergeToolStarted(),
+                },
+              ];
+            }
+            return current.map((evt) =>
+              evt.id === timelineId ? { ...evt, body: evt.body + delta, completed: false } : evt,
+            );
           });
         }
         return;
       }
 
-      if (method === 'item/reasoning/textDelta' && envelope.params) {
-        const params = envelope.params as { itemId?: string; delta?: string };
-        const itemId = params.itemId;
-        const delta = params.delta ?? '';
-        if (itemId && delta) {
-          const key = `reasoningText:${itemId}`;
-          setTimeline((current) => {
-            const timelineId = streamingToolRef.current.get(key);
-            if (!timelineId) {
-              const id = crypto.randomUUID();
-              streamingToolRef.current.set(key, id);
-              return [...current, { id, kind: 'tool', subtype: 'reasoning', title: '推理（原始）', body: delta }];
-            }
-            return current.map((evt) => (evt.id === timelineId ? { ...evt, body: evt.body + delta } : evt));
-          });
-        }
+      if (method === 'item/reasoning/textDelta') {
         return;
       }
 
       if (method === 'turn/completed') {
+        setTurnTiming((current) => {
+          const turnIndex = turnIndexRef.current;
+          const existing = current[turnIndex];
+          if (!existing) return current;
+          return { ...current, [turnIndex]: { ...existing, completedAt: Date.now() } };
+        });
         const finalText = streamingTextRef.current.trim();
         if (finalText) {
           commitAgentReplyRef.current(finalText, true);
@@ -1256,6 +1618,8 @@ export default function App() {
         const createdId = responseThreadId;
         const mode = pendingSessionModeRef.current;
         if (projectId && createdId) {
+          const sessionTitle = pendingSessionTitleRef.current || '新会话';
+          pendingSessionTitleRef.current = null;
           pendingCreateSessionProjectIdRef.current = null;
           pendingSessionModeRef.current = 'local';
           const upsertLocal = () =>
@@ -1264,12 +1628,15 @@ export default function App() {
               threadId: createdId,
               mode,
               worktreePath: null,
-              title: '新会话',
+              title: sessionTitle,
               updatedAt: nowSeconds(),
               status: mode,
             })
               .then(() => invoke<SessionRow[]>('sessions_for_project', { projectId }))
-              .then((next) => setSessions(next));
+              .then((next) => {
+                setSessions(next);
+                setSessionsListExpanded(true);
+              });
 
           if (mode === 'worktree') {
             const project = projectsRef.current.find((p) => p.id === projectId);
@@ -1281,7 +1648,7 @@ export default function App() {
                     threadId: createdId,
                     mode: 'worktree',
                     worktreePath: wtPath,
-                    title: '新会话 (worktree)',
+                    title: sessionTitle,
                     updatedAt: nowSeconds(),
                     status: 'worktree',
                   }),
@@ -1316,31 +1683,31 @@ export default function App() {
 
       if (requestMethod === 'thread/read' && envelope.result) {
         const chatMsgs = timelineFromThreadRead(envelope.result);
-        const latestAgent = [...chatMsgs].reverse().find((m) => m.kind === 'agent');
 
         if (waitingForReplyRef.current) {
-          if (latestAgent?.body) {
-            commitAgentReplyRef.current(latestAgent.body, isLatestTurnFinished(envelope.result));
+          const agentText = latestAgentFromCurrentTurn(envelope.result);
+          if (agentText) {
+            commitAgentReplyRef.current(agentText, isLatestTurnFinished(envelope.result));
           }
           skipAppend = true;
-        } else {
+        } else if (sessionHydrateRef.current) {
           setTimeline(chatMsgs);
           setThreadGitInfo(extractThreadGitInfo(envelope.result));
           setThreadSettingsView(extractThreadSettings(envelope.result));
+          sessionHydrateRef.current = false;
           skipAppend = true;
 
           const projectId = selectedProjectIdRef.current;
           const thread = (envelope.result as any)?.thread ?? (envelope.result as any);
           const tid = typeof thread?.id === 'string' ? thread.id : null;
           if (projectId && tid) {
-            const title = (typeof thread?.name === 'string' && thread.name.trim()) ? thread.name : (typeof thread?.preview === 'string' ? thread.preview : null);
             const updatedAt = typeof thread?.updatedAt === 'number' ? thread.updatedAt : nowSeconds();
             invoke('session_upsert', {
               projectId,
               threadId: tid,
               mode: null,
               worktreePath: null,
-              title: title || undefined,
+              title: null,
               updatedAt,
               status: thread?.status ? String(thread.status) : undefined,
             })
@@ -1348,6 +1715,8 @@ export default function App() {
               .then((next) => setSessions(next))
               .catch(() => {});
           }
+        } else {
+          skipAppend = true;
         }
       }
 
@@ -1369,8 +1738,12 @@ export default function App() {
       }
 
       if (nextThreadId) {
-        setThreadId(nextThreadId);
-        threadIdRef.current = nextThreadId;
+        const isOurThreadStart = requestMethod === 'thread/start' && Boolean(envelope.result);
+        if (!draftSessionRef.current || isOurThreadStart) {
+          setThreadId(nextThreadId);
+          threadIdRef.current = nextThreadId;
+          if (isOurThreadStart) draftSessionRef.current = false;
+        }
       }
 
       if (envelope.error && requestMethod === 'thread/start') {
@@ -1385,11 +1758,9 @@ export default function App() {
         ]);
       }
 
-        if (!skipAppend) {
+        if (!skipAppend && shouldAppendEnvelopeToTimeline(envelope)) {
           const item = classifyEnvelope(envelope);
-          if (requestMethod !== 'thread/read') {
-            setTimeline((current) => [...current, item]);
-          }
+          setTimeline((current) => [...current, item]);
         }
         }),
       );
@@ -1431,13 +1802,12 @@ export default function App() {
         connectCodex(false)
           .then(async (connected) => {
             if (!connected) return undefined;
-            warmupThread().catch(() => {});
             window.setTimeout(() => {
               refreshEnterpriseCapabilities().catch(() => {});
             }, 8000);
             return undefined;
           })
-          .catch((error) => appendError('企业研发助手连接失败', error));
+          .catch((error) => appendError(`${APP_NAME}连接失败`, error));
       }
     };
     void registerListeners();
@@ -1460,10 +1830,10 @@ export default function App() {
   }, []);
 
   const activeConversation = useMemo(() => {
-    if (!threadId) return conversations[0];
+    if (!threadId) return null;
     return conversations.find((conversation) => conversation.id === threadId) ?? {
       id: threadId,
-      title: '当前 Codex 会话',
+      title: '当前会话',
       updated: '刚刚',
       status: '运行中',
     };
@@ -1483,7 +1853,7 @@ export default function App() {
   }
 
   async function connectCodex(showMessage = true) {
-    if (!(await ensureTauri('无法连接企业研发助手'))) return null;
+    if (!(await ensureTauri(`无法连接${APP_NAME}`))) return null;
     const check = codexCheck ?? (await invoke<CodexCheckResult>('codex_check'));
     setCodexCheck(check);
     if (!check.installed) {
@@ -1499,10 +1869,11 @@ export default function App() {
       threadWarmupRef.current = null;
     }
     if (!nextStatus.initialized) {
-      await invoke<number>('codex_initialize', { clientName: 'codex_enterprise_client' });
+      await invoke<number>('codex_initialize', { clientName: 'yupao_codex' });
       nextStatus = { ...nextStatus, running: true, initialized: true };
     }
     setStatus(nextStatus);
+    void refreshModelCatalog();
     if (showMessage) {
       setTimeline((current) => [
         ...current,
@@ -1545,31 +1916,90 @@ export default function App() {
     const cwd = projectPathRef.current || null;
     const activeThreadId = threadIdRef.current;
     await Promise.allSettled([
-      invoke<number>('codex_list_threads', { cwd, searchTerm: null }),
       invoke<number>('codex_list_skills', { cwd, forceReload: false }),
       invoke<number>('codex_list_mcp_servers', { threadId: activeThreadId }),
+      refreshModelCatalog(),
     ]);
   }
 
+  function getFirstProject(): Project | null {
+    return projectsRef.current[0] ?? null;
+  }
+
+  function promptAddProject() {
+    appendError('请先添加项目', addProjectHint);
+  }
+
+  function bindSessionProject(project: Project) {
+    setSelectedProjectId(project.id);
+    selectedProjectIdRef.current = project.id;
+    setProjectPath(project.path);
+    projectPathRef.current = project.path;
+    pendingCreateSessionProjectIdRef.current = project.id;
+    setExpandedProjectIds((current) => new Set(current).add(project.id));
+  }
+
   async function startThread() {
-    setBusy(true);
-    try {
-      if (!(await connectCodex(false))) return;
-      if (selectedProjectId) {
-        pendingCreateSessionProjectIdRef.current = selectedProjectId;
-        pendingSessionModeRef.current = sessionMode;
-      }
-      const requestId = await invoke<number>('codex_start_thread', { cwd: projectPath || null, model: null });
-      setActiveNav('新对话');
-      setTimeline((current) => [
-        ...current,
-        { id: crypto.randomUUID(), kind: 'system', title: '新对话已准备', body: `正在为当前目录创建工作区对话。请求编号 ${requestId}` },
-      ]);
-    } catch (error) {
-      appendError('创建会话失败', error);
-    } finally {
-      setBusy(false);
+    const firstProject = getFirstProject();
+    if (!firstProject) {
+      promptAddProject();
+      return;
     }
+    prepareDraftSession(firstProject);
+    try {
+      const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: firstProject.id });
+      setSessions(nextSessions);
+    } catch (error) {
+      appendError('读取会话列表失败', error);
+    }
+  }
+
+  function prepareDraftSession(project: Project | null) {
+    if (project) {
+      bindSessionProject(project);
+    } else {
+      setSelectedProjectId(null);
+      selectedProjectIdRef.current = null;
+      setProjectPath('');
+      projectPathRef.current = '';
+      pendingCreateSessionProjectIdRef.current = null;
+    }
+    setThreadId(null);
+    threadIdRef.current = null;
+    threadWarmupRef.current = null;
+    pendingCreateSessionProjectIdRef.current = project?.id ?? null;
+    pendingSessionModeRef.current = sessionMode;
+    draftSessionRef.current = true;
+    sessionHydrateRef.current = false;
+    setPendingApprovals([]);
+    setTurnTiming({});
+    setTimeline([]);
+    setWaitingForReply(false);
+    setStreamingText('');
+    streamingAgentRef.current = null;
+    setTurnState('idle');
+    setActiveNav('新对话');
+    setSessionsListExpanded(true);
+    void connectCodex(false);
+  }
+
+  async function upsertSessionForThread(threadId: string, text: string, attachments: ComposerAttachment[]) {
+    const projectId = pendingCreateSessionProjectIdRef.current ?? selectedProjectIdRef.current;
+    if (!projectId) return;
+    const title = sessionTitleFromInput(text, attachments);
+    const existing = sessionsRef.current.find((session) => session.thread_id === threadId);
+    await invoke('session_upsert', {
+      projectId,
+      threadId,
+      mode: existing?.mode ?? (sessionMode === 'worktree' ? 'worktree' : 'local'),
+      worktreePath: existing?.worktree_path ?? null,
+      title,
+      updatedAt: nowSeconds(),
+      status: existing?.status ?? sessionMode,
+    });
+    const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId });
+    setSessions(nextSessions);
+    setSessionsListExpanded(true);
   }
 
   async function resumeConversation(conversation: Conversation) {
@@ -1595,12 +2025,21 @@ export default function App() {
         pendingCreateSessionProjectIdRef.current = selectedProjectIdRef.current;
         pendingSessionModeRef.current = sessionMode;
       }
+      const permArgs = threadStartPermissionArgs(
+        permissionModeRef.current,
+        projectPathRef.current || null,
+      );
       const id = await invoke<string>('codex_start_thread_sync', {
         cwd: projectPathRef.current || null,
-        model: null,
+        model: selectedModelRef.current || null,
+        approvalPolicy: permArgs.approvalPolicy ?? null,
+        approvalsReviewer: permArgs.approvalsReviewer ?? null,
+        sandbox: permArgs.sandbox ?? null,
       });
       setThreadId(id);
       threadIdRef.current = id;
+      draftSessionRef.current = false;
+      await applyThreadPermissionSettings(id, permissionModeRef.current, projectPathRef.current || null);
       return id;
     })();
     threadWarmupRef.current = task;
@@ -1622,24 +2061,70 @@ export default function App() {
       pendingCreateSessionProjectIdRef.current = selectedProjectId;
       pendingSessionModeRef.current = sessionMode;
     }
-    const id = await invoke<string>('codex_start_thread_sync', { cwd: projectPath || null, model: null });
+    const permArgs = threadStartPermissionArgs(
+      permissionModeRef.current,
+      projectPathRef.current || projectPath || null,
+    );
+    const id = await invoke<string>('codex_start_thread_sync', {
+      cwd: projectPath || null,
+      model: selectedModelRef.current || null,
+      approvalPolicy: permArgs.approvalPolicy ?? null,
+      approvalsReviewer: permArgs.approvalsReviewer ?? null,
+      sandbox: permArgs.sandbox ?? null,
+    });
     setThreadId(id);
     threadIdRef.current = id;
+    draftSessionRef.current = false;
+    await applyThreadPermissionSettings(id, permissionModeRef.current, projectPathRef.current || projectPath || null);
     return id;
   }
 
-  async function dispatchPromptText(text: string) {
-    if (!text) return;
+  async function dispatchPrompt(payload: ComposerSubmitPayload) {
+    const { text, attachments, planMode: nextPlanMode, goalMode: nextGoalMode } = payload;
+    const trimmed = text.trim();
+    if (!trimmed && attachments.length === 0) return;
+
+    if (!threadIdRef.current) {
+      const targetId = pendingCreateSessionProjectIdRef.current ?? selectedProjectIdRef.current;
+      const targetProject = targetId ? projectsRef.current.find((project) => project.id === targetId) ?? null : null;
+      if (!targetProject) {
+        const firstProject = getFirstProject();
+        if (!firstProject) {
+          promptAddProject();
+          return;
+        }
+        bindSessionProject(firstProject);
+      } else {
+        bindSessionProject(targetProject);
+      }
+    }
+
+    let promptText = trimmed;
+    if (nextPlanMode) {
+      promptText = `请按步骤给出计划并标注风险与验证方式：\n${promptText || '请先给出一个简洁执行计划，再开始执行。'}`;
+    }
+
     const pollToken = crypto.randomUUID();
     replyPollTokenRef.current = pollToken;
     setBusy(true);
     setWaitingForReply(true);
     setStreamingText('');
     streamingAgentRef.current = null;
+
+    const timelineBody =
+      attachments.length > 0
+        ? [trimmed, attachments.map((item) => `[${item.kind === 'image' ? '图片' : '文件'}] ${item.name}`).join('\n')]
+            .filter(Boolean)
+            .join('\n')
+        : trimmed;
+
+    pendingSessionTitleRef.current = sessionTitleFromInput(trimmed, attachments);
+
     setTimeline((current) => [
       ...current,
-      { id: crypto.randomUUID(), kind: 'user', title: '用户', body: text },
+      { id: crypto.randomUUID(), kind: 'user', title: '用户', body: timelineBody },
     ]);
+
     try {
       if (!(await connectCodex(false))) {
         replyPollTokenRef.current = null;
@@ -1650,8 +2135,36 @@ export default function App() {
         ]);
         return;
       }
+
       const activeThreadId = await ensureThreadId();
-      await invoke<number>('codex_start_turn', { threadId: activeThreadId, text, cwd: projectPath || null });
+      await upsertSessionForThread(activeThreadId, trimmed, attachments);
+
+      if (nextGoalMode && goalObjective.trim()) {
+        await invoke<number>('codex_set_thread_goal', {
+          threadId: activeThreadId,
+          objective: goalObjective.trim(),
+          status: goalStatus.trim() || 'active',
+          tokenBudget: goalTokenBudget.trim() ? Number(goalTokenBudget.trim()) : null,
+        });
+      }
+
+      const permissionSettings = permissionModeToSettings(
+        permissionModeRef.current,
+        projectPath || null,
+      );
+      const turnInput = buildTurnInput(attachments, promptText);
+
+      await invoke<number>('codex_start_turn', {
+        threadId: activeThreadId,
+        text: null,
+        input: turnInput,
+        cwd: projectPath || null,
+        model: selectedModelRef.current || null,
+        effort: selectedEffortRef.current || null,
+        approvalPolicy: permissionSettings?.approvalPolicy ?? null,
+        approvalsReviewer: permissionSettings?.approvalsReviewer ?? null,
+        sandboxPolicy: permissionSettings?.sandboxPolicy ?? null,
+      });
       void syncPollAgentReply(activeThreadId, pollToken);
     } catch (error) {
       replyPollTokenRef.current = null;
@@ -1665,6 +2178,10 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function dispatchPromptText(text: string) {
+    await dispatchPrompt({ text, attachments: [], planMode: false, goalMode: false });
   }
 
   async function executeSlashCommand(raw: string) {
@@ -1962,13 +2479,13 @@ export default function App() {
     }
   }
 
-  async function sendPrompt(text: string) {
-    if (!text) return;
-    if (text.startsWith('/')) {
+  async function sendPrompt(payload: ComposerSubmitPayload) {
+    const text = payload.text.trim();
+    if (text.startsWith('/') && payload.attachments.length === 0) {
       await executeSlashCommand(text);
       return;
     }
-    await dispatchPromptText(text);
+    await dispatchPrompt(payload);
   }
 
   async function interrupt() {
@@ -2015,36 +2532,68 @@ export default function App() {
   const navItems = [
     { label: '新对话', icon: MessageSquareText },
     { label: '搜索', icon: Search },
-    { label: '插件', icon: Puzzle },
-    { label: '自动化', icon: CalendarClock },
+    { label: '插件', icon: Puzzle, disabled: true },
+    { label: '自动化', icon: CalendarClock, disabled: true },
   ];
 
   async function pickAndAddProject() {
     try {
       if (!(await ensureTauri('无法选择文件夹'))) return;
-      const selection = await openDialog({ directory: true, multiple: false });
+      const selection = await openDialog({
+        directory: true,
+        multiple: false,
+        title: '选择项目文件夹',
+      });
       const path = typeof selection === 'string' ? selection : Array.isArray(selection) ? selection[0] : null;
       if (!path) return;
+
+      const existing = projectsRef.current.find((project) => project.path === path);
+      if (existing) {
+        await selectProject(existing);
+        return;
+      }
+
       const created = await invoke<Project>('project_add', { path, name: null, now: nowSeconds() });
       const nextProjects = await invoke<Project[]>('projects_list');
       setProjects(nextProjects);
       setSelectedProjectId(created.id);
       setProjectPath(created.path);
+      projectPathRef.current = created.path;
+      selectedProjectIdRef.current = created.id;
+      setSessionsListExpanded(true);
       const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: created.id });
       setSessions(nextSessions);
-      setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'system', title: '已添加项目', body: created.path }]);
+      await invoke('project_touch', { projectId: created.id, now: nowSeconds() });
     } catch (error) {
       appendError('添加项目失败', error);
     }
   }
 
+  function toggleProjectExpanded(projectId: number) {
+    setExpandedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  }
+
   async function selectProject(project: Project) {
     setSelectedProjectId(project.id);
+    selectedProjectIdRef.current = project.id;
     setProjectPath(project.path);
+    projectPathRef.current = project.path;
+    setExpandedProjectIds((current) => new Set(current).add(project.id));
+    draftSessionRef.current = true;
+    sessionHydrateRef.current = false;
     setThreadId(null);
     threadIdRef.current = null;
     threadWarmupRef.current = null;
-    setTimeline([{ id: crypto.randomUUID(), kind: 'system', title: '已切换项目', body: project.path }]);
+    pendingCreateSessionProjectIdRef.current = null;
+    setPendingApprovals([]);
+    setTurnTiming({});
+    setTimeline([]);
+    setSessionsListExpanded(false);
     try {
       await invoke('project_touch', { projectId: project.id, now: nowSeconds() });
       const nextProjects = await invoke<Project[]>('projects_list');
@@ -2052,7 +2601,6 @@ export default function App() {
       const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: project.id });
       setSessions(nextSessions);
       await connectCodex(false);
-      await invoke<number>('codex_list_threads', { cwd: project.path || null, searchTerm: null });
     } catch (error) {
       appendError('切换项目失败', error);
     }
@@ -2082,20 +2630,70 @@ export default function App() {
     }
   }
 
-  async function startSessionUnderProject(project: Project) {
-    setSelectedProjectId(project.id);
-    setProjectPath(project.path);
-    setBusy(true);
+  function openProjectContextMenu(event: React.MouseEvent, project: Project) {
+    event.preventDefault();
+    event.stopPropagation();
+    setProjectContextMenu({ project, x: event.clientX, y: event.clientY });
+  }
+
+  async function togglePinProject(project: ProjectMenuTarget) {
     try {
-      if (!(await connectCodex(false))) return;
-      pendingCreateSessionProjectIdRef.current = project.id;
-      pendingSessionModeRef.current = sessionMode;
-      await invoke<number>('codex_start_thread', { cwd: project.path || null, model: null });
+      if (!(await ensureTauri('无法置顶项目'))) return;
+      await invoke('project_set_pinned', {
+        projectId: project.id,
+        pinned: !project.pinned,
+      });
+      const nextProjects = await invoke<Project[]>('projects_list');
+      setProjects(nextProjects);
     } catch (error) {
-      appendError('新建会话失败', error);
-    } finally {
-      setBusy(false);
+      appendError('置顶项目失败', error);
     }
+  }
+
+  async function openProjectDirectory(project: ProjectMenuTarget) {
+    try {
+      if (!(await ensureTauri('无法打开目录'))) return;
+      await invoke('open_path', { path: project.path });
+    } catch (error) {
+      appendError('打开目录失败', error);
+    }
+  }
+
+  function renameProjectFromMenu(project: ProjectMenuTarget) {
+    const existing = projectsRef.current.find((item) => item.id === project.id);
+    if (existing) beginRenameProject(existing);
+  }
+
+  async function removeProjectFromApp(project: ProjectMenuTarget) {
+    try {
+      if (!(await ensureTauri('无法移除项目'))) return;
+      await invoke('project_remove', { projectId: project.id });
+      const nextProjects = await invoke<Project[]>('projects_list');
+      setProjects(nextProjects);
+      setExpandedProjectIds((current) => {
+        const next = new Set(current);
+        next.delete(project.id);
+        return next;
+      });
+      if (selectedProjectIdRef.current === project.id) {
+        const fallback = nextProjects[0] ?? null;
+        if (fallback) {
+          await selectProject(fallback);
+        } else {
+          setSelectedProjectId(null);
+          selectedProjectIdRef.current = null;
+          setProjectPath('');
+          projectPathRef.current = '';
+          prepareDraftSession(null);
+        }
+      }
+    } catch (error) {
+      appendError('移除项目失败', error);
+    }
+  }
+
+  function startSessionUnderProject(project: Project) {
+    prepareDraftSession(project);
   }
 
   async function removeWorktree(session: SessionRow) {
@@ -2188,6 +2786,8 @@ export default function App() {
       setSessionMode(session.mode === 'worktree' ? 'worktree' : 'local');
       invoke('project_touch', { projectId: project.id, now: nowSeconds() }).catch(() => {});
     }
+    draftSessionRef.current = false;
+    sessionHydrateRef.current = true;
     setThreadId(session.thread_id);
     setActiveNav('历史会话');
     setBusy(true);
@@ -2199,6 +2799,39 @@ export default function App() {
       appendError('打开会话失败', error);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function togglePinSession(session: SessionRow) {
+    try {
+      if (!(await ensureTauri('无法置顶会话'))) return;
+      await invoke('session_set_pinned', {
+        projectId: session.project_id,
+        threadId: session.thread_id,
+        pinned: !session.pinned,
+      });
+      const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: session.project_id });
+      setSessions(nextSessions);
+    } catch (error) {
+      appendError('置顶会话失败', error);
+    }
+  }
+
+  async function deleteSession(session: SessionRow) {
+    try {
+      if (!(await ensureTauri('无法删除会话'))) return;
+      await invoke('session_delete', {
+        projectId: session.project_id,
+        threadId: session.thread_id,
+      });
+      if (threadIdRef.current === session.thread_id) {
+        const project = projectsRef.current.find((p) => p.id === session.project_id) ?? null;
+        prepareDraftSession(project);
+      }
+      const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: session.project_id });
+      setSessions(nextSessions);
+    } catch (error) {
+      appendError('删除会话失败', error);
     }
   }
 
@@ -2578,47 +3211,92 @@ export default function App() {
     return sessions.filter((s) => (s.title || '').toLowerCase().includes(q) || s.thread_id.toLowerCase().includes(q));
   }, [sessions, searchQuery]);
 
-  const chatTimeline = useMemo(() => timeline.filter(isChatMessage), [timeline]);
-
-  const visibleTimeline = useMemo(() => {
-    const limit = 100;
-    if (chatTimeline.length <= limit) return chatTimeline;
-    return chatTimeline.slice(-limit);
-  }, [chatTimeline]);
-
-  const renderedTimeline = useMemo(
-    () =>
-      visibleTimeline.map((event) => (
-        <article
-          key={event.id}
-          className={`event chat-bubble ${event.kind === 'user' ? 'chat-user' : 'chat-agent'}`}
-        >
-          <pre>{event.body}</pre>
-        </article>
-      )),
-    [visibleTimeline],
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === selectedProjectId) ?? null,
+    [projects, selectedProjectId],
   );
 
-  return (
-    <div className="app-shell enterprise-shell">
-      <aside className="sidebar enterprise-sidebar">
-        <div className="window-controls">
-          <span className="dot red" />
-          <span className="dot yellow" />
-          <span className="dot green" />
-        </div>
+  const projectSessions = useMemo(() => {
+    if (!selectedProjectId) return [];
+    return filteredSessions
+      .filter((session) => session.project_id === selectedProjectId)
+      .sort((a, b) => {
+        const pinDiff = Number(Boolean(b.pinned)) - Number(Boolean(a.pinned));
+        if (pinDiff !== 0) return pinDiff;
+        return (b.updated_at ?? 0) - (a.updated_at ?? 0);
+      });
+  }, [filteredSessions, selectedProjectId]);
 
+  const visibleProjectSessions = useMemo(() => {
+    if (sessionsListExpanded) return projectSessions;
+    return projectSessions.slice(0, 5);
+  }, [projectSessions, sessionsListExpanded]);
+
+  const draftMode = !threadId && !!selectedProject;
+
+  const threadTimeline = useMemo(() => timeline.filter(isThreadRenderable), [timeline]);
+
+  const visibleTimeline = useMemo(() => {
+    const limit = 200;
+    if (threadTimeline.length <= limit) return threadTimeline;
+    return threadTimeline.slice(-limit);
+  }, [threadTimeline]);
+
+  const showThinkingShimmer = useMemo(() => {
+    if (!waitingForReply) return false;
+    const hasInProgress = visibleTimeline.some(
+      (evt) => evt.turnIndex === turnIndex && evt.completed === false,
+    );
+    return !hasInProgress && turnState === 'thinking';
+  }, [waitingForReply, visibleTimeline, turnState, turnIndex]);
+
+  const activeThreadTitle = useMemo(() => {
+    if (threadId) {
+      const session = sessions.find((item) => item.thread_id === threadId);
+      if (session?.title?.trim()) return session.title.trim();
+    }
+    return activeConversation?.title ?? '新对话';
+  }, [threadId, sessions, activeConversation]);
+
+  const renderedTimeline = useMemo(
+    () => (
+      <ThreadTimelineView
+        items={visibleTimeline}
+        turnTiming={turnTiming}
+        activeTurnIndex={turnIndex}
+        waitingForReply={waitingForReply}
+      />
+    ),
+    [visibleTimeline, turnTiming, turnIndex, waitingForReply],
+  );
+
+  const showProjectHero = draftMode && visibleTimeline.length === 0 && !waitingForReply && !showThinkingShimmer;
+
+  return (
+    <div className="app-shell codex-shell">
+      <aside className="sidebar codex-sidebar">
         <nav className="nav-stack">
           {navItems.map((item) => {
             const Icon = item.icon;
+            const disabled = Boolean(item.disabled);
             return (
               <button
                 key={item.label}
-                className={activeNav === item.label ? 'nav-item active' : 'nav-item'}
+                type="button"
+                className={[
+                  'nav-item',
+                  activeNav === item.label && !disabled ? 'active' : '',
+                  disabled ? 'is-disabled' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')}
+                disabled={disabled}
+                title={disabled ? '功能开发中' : undefined}
                 onClick={() => {
+                  if (disabled) return;
                   setActiveNav(item.label);
                   setSettingsOpen(false);
-                  if (item.label === '插件') refreshEnterpriseCapabilities();
+                  if (item.label === '新对话') void startThread();
                 }}
               >
                 <Icon size={16} />
@@ -2640,86 +3318,163 @@ export default function App() {
           </section>
         )}
 
-        {activeNav === '插件' && (
-          <section className="sidebar-section grow">
-            <div className="sidebar-label">Skills</div>
-            <InventoryList items={skills} emptyText="连接后刷新 Skill" />
-            <div className="sidebar-label">MCP 服务器</div>
-            <InventoryList items={mcpServers} emptyText="连接后刷新 MCP" />
-            <button className="project-add" onClick={refreshEnterpriseCapabilities} disabled={busy}>
-              <Workflow size={15} />
-              刷新插件列表
-            </button>
-          </section>
-        )}
-
-        {activeNav !== '插件' && (
-        <>
-        <section className="sidebar-section">
-          <div className="sidebar-label">项目</div>
-          <button className="project-add" onClick={pickAndAddProject}>
-            <FolderPlus size={15} />
-            新建文件夹
-          </button>
-          <div className="project-list">
-            {projects.map((project) => (
-              <div key={project.id} className={project.id === selectedProjectId ? 'project-item selected' : 'project-item'}>
-                <button className="project-main" onClick={() => selectProject(project)} title={project.path}>
-                  <FolderOpen size={15} />
-                  {editingProjectId === project.id ? (
-                    <input
-                      className="project-rename"
-                      value={editingProjectName}
-                      onChange={(e) => setEditingProjectName(e.target.value)}
-                      onBlur={() => submitRenameProject()}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') submitRenameProject();
-                        if (e.key === 'Escape') setEditingProjectId(null);
-                      }}
-                      autoFocus
-                    />
-                  ) : (
-                    <span onDoubleClick={() => beginRenameProject(project)}>{project.name}</span>
-                  )}
-                </button>
-                <button className="project-new-session" onClick={() => startSessionUnderProject(project)} title="新建会话">
-                  <Plus size={16} />
-                </button>
-              </div>
-            ))}
+        <section className="sidebar-section project-section">
+          <div className="sidebar-section-header">
+            <span className="sidebar-label">项目</span>
+            <div className="sidebar-header-actions">
+              <button className="sidebar-icon-btn" type="button" title="更多" onClick={openSettings}>
+                <MoreHorizontal size={15} />
+              </button>
+              <button className="sidebar-icon-btn" type="button" title="添加文件夹" onClick={() => void pickAndAddProject()}>
+                <FolderPlus size={15} />
+              </button>
+            </div>
           </div>
+
+          {projects.length === 0 ? (
+            <div className="project-empty">
+              <FolderOpen size={15} />
+              <span>暂无对话</span>
+            </div>
+          ) : (
+            <div className="project-list">
+              {projects.map((project) => {
+                const isActive = project.id === selectedProjectId;
+                const isExpanded = expandedProjectIds.has(project.id);
+                return (
+                  <div
+                    key={project.id}
+                    className={isActive ? 'project-group selected' : 'project-group'}
+                    onContextMenu={(event) => openProjectContextMenu(event, project)}
+                  >
+                    <div className="project-group-header">
+                      <button
+                        className="project-chevron-btn"
+                        type="button"
+                        title={isExpanded ? '收起会话' : '展开会话'}
+                        onClick={() => {
+                          if (isActive) {
+                            toggleProjectExpanded(project.id);
+                            return;
+                          }
+                          void selectProject(project);
+                        }}
+                      >
+                        {isActive && isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </button>
+                      <button
+                        className="project-folder-btn"
+                        type="button"
+                        onClick={() => {
+                          if (isActive && isExpanded) {
+                            toggleProjectExpanded(project.id);
+                            return;
+                          }
+                          void selectProject(project);
+                        }}
+                        title={project.path}
+                      >
+                        <FolderOpen size={15} />
+                        {editingProjectId === project.id ? (
+                          <input
+                            className="project-rename"
+                            value={editingProjectName}
+                            onChange={(e) => setEditingProjectName(e.target.value)}
+                            onBlur={() => submitRenameProject()}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') submitRenameProject();
+                              if (e.key === 'Escape') setEditingProjectId(null);
+                            }}
+                            autoFocus
+                          />
+                        ) : (
+                          <span onDoubleClick={() => beginRenameProject(project)}>{project.name}</span>
+                        )}
+                      </button>
+                      <div className="project-group-actions">
+                        <button
+                          className="sidebar-icon-btn"
+                          type="button"
+                          title="新建会话"
+                          onClick={() => startSessionUnderProject(project)}
+                        >
+                          <SquarePen size={15} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {isActive && isExpanded ? (
+                      <div className="project-sessions">
+                        {projectSessions.length === 0 ? (
+                          <div className="project-session-empty">
+                            <FolderOpen size={14} />
+                            <span>暂无对话</span>
+                          </div>
+                        ) : (
+                          <>
+                            {visibleProjectSessions.map((session) => (
+                              <div
+                                key={`${session.project_id}-${session.thread_id}`}
+                                className={
+                                  session.thread_id === threadId
+                                    ? `project-session-row selected${session.pinned ? ' pinned' : ''}`
+                                    : `project-session-row${session.pinned ? ' pinned' : ''}`
+                                }
+                              >
+                                <button
+                                  type="button"
+                                  className="project-session-item"
+                                  onClick={() => void openSession(session)}
+                                >
+                                  <span className="project-session-title">{session.title || '未命名会话'}</span>
+                                  <span className="project-session-time">{formatTime(session.updated_at) || '刚刚'}</span>
+                                </button>
+                                <div className="project-session-actions">
+                                  <button
+                                    type="button"
+                                    className={session.pinned ? 'session-action-btn active' : 'session-action-btn'}
+                                    title={session.pinned ? '取消置顶' : '置顶对话'}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void togglePinSession(session);
+                                    }}
+                                  >
+                                    <Pin size={14} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="session-action-btn"
+                                    title="删除对话"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void deleteSession(session);
+                                    }}
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                            {projectSessions.length > 5 && !sessionsListExpanded ? (
+                              <button className="project-expand" type="button" onClick={() => setSessionsListExpanded(true)}>
+                                展开显示
+                              </button>
+                            ) : null}
+                          </>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </section>
 
         <section className="sidebar-section grow">
-          <div className="sidebar-label">会话</div>
-          <div className="thread-list">
-            {filteredSessions.map((session) => (
-              <div key={`${session.project_id}-${session.thread_id}`} className="session-row">
-                <button
-                  className={session.thread_id === threadId ? 'thread-item selected' : 'thread-item'}
-                  onClick={() => openSession(session)}
-                >
-                  <span className="thread-title">{session.title || '未命名会话'}</span>
-                  <span className="thread-meta">
-                    {session.mode === 'worktree' ? 'worktree' : session.status || '历史'}
-                    <span>{session.updated_at ? formatTime(session.updated_at) : '未知'}</span>
-                  </span>
-                </button>
-                {session.mode === 'worktree' ? (
-                  <button className="session-worktree" onClick={() => removeWorktree(session)} title="移除 worktree">
-                    ×
-                  </button>
-                ) : (
-                  <button className="session-worktree" onClick={() => enableWorktree(session)} title="为该会话创建 worktree">
-                    WT
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
+          <div className="sidebar-label">对话</div>
+          {!threadId ? <div className="chat-empty-label">暂无聊天</div> : null}
         </section>
-        </>
-        )}
 
         <button className="settings-row" onClick={openSettings}>
           <Settings size={16} />
@@ -2727,67 +3482,41 @@ export default function App() {
         </button>
       </aside>
 
-      <main className="workspace enterprise-workspace">
+      <ProjectContextMenu
+        menu={projectContextMenu}
+        onClose={() => setProjectContextMenu(null)}
+        onPin={(project) => void togglePinProject(project)}
+        onOpenDirectory={(project) => void openProjectDirectory(project)}
+        onRename={renameProjectFromMenu}
+        onRemove={(project) => void removeProjectFromApp(project)}
+      />
+
+      <main className="workspace codex-main">
         {codexCheck && !codexCheck.installed && (
           <div className="codex-banner">
             <strong>未检测到 Codex CLI</strong>
-            <span>需要先安装 `codex` 并确保在 PATH 中可用，然后点击“连接”。</span>
+            <span>需要先安装 `codex` 并确保在 PATH 中可用，然后在设置中连接。</span>
             {codexCheck.error && <code>{codexCheck.error}</code>}
           </div>
         )}
-        <header className="topbar enterprise-topbar">
-          <div>
-            <h1>{activeConversation?.title ?? '中国企业版 Codex 客户端'}</h1>
-            <p>面向企业研发流程：对话、MCP、Skill、审批和历史会话都走官方 app-server 协议。</p>
-          </div>
-          <div className="topbar-actions">
-            <button onClick={startCodex} disabled={busy || (codexCheck ? !codexCheck.installed : false)}>
-              <Play size={16} /> {status.running ? '重连' : '连接'}
-            </button>
-            <button onClick={startThread} disabled={busy || (codexCheck ? !codexCheck.installed : false)}><Plus size={16} /> 新建会话</button>
-            <button onClick={refreshEnterpriseCapabilities} disabled={busy}><Workflow size={16} /> 刷新保障项</button>
-            <button onClick={() => { setDiffOpen((v) => !v); if (!diffOpen) refreshDiff(); }} disabled={busy}>
-              Diff
-            </button>
-            <button onClick={startReview} disabled={busy || (codexCheck ? !codexCheck.installed : false)}>/review</button>
-            <button
-              onClick={() => {
-                const next = window.prompt('输入新的会话名称');
-                if (next) renameCurrentThread(next);
-              }}
-              disabled={!threadId}
-            >
-              重命名会话
-            </button>
-            <button onClick={forkCurrentThread} disabled={!threadId}>分叉会话</button>
-            <button
-              onClick={() => {
-                const raw = window.prompt('回滚最近几轮？（>=1）', '1');
-                if (!raw) return;
-                const n = Number(raw);
-                if (!Number.isFinite(n) || n < 1) return;
-                rollbackCurrentThread(n);
-              }}
-              disabled={!threadId}
-            >
-              回滚
-            </button>
-            <button onClick={archiveCurrentThread} disabled={!threadId}>归档</button>
-            <button onClick={unarchiveCurrentThread} disabled={!threadId}>取消归档</button>
-            <button onClick={interrupt} disabled={!threadId}><CircleStop size={16} /> 中断</button>
-          </div>
-        </header>
+        {threadId && !showProjectHero ? (
+          <header className="thread-header">
+            <h1>{activeThreadTitle}</h1>
+          </header>
+        ) : null}
 
-        <section className="content-grid enterprise-grid">
-          <div className="panel transcript chat-panel">
-            <div className="panel-title">对话</div>
-            <div className="chat-scroll" ref={timelineScrollRef}>
-              {renderedTimeline}
-              {waitingForReply || streamingText ? (
-                <article className="event chat-bubble chat-agent chat-thinking">
-                  <pre>{streamingText || replyHint || '思考中…'}</pre>
-                </article>
+        <section className="thread-body">
+          <div className="thread-chat">
+            <div className={`chat-scroll ${showProjectHero ? 'chat-scroll-hero' : ''}`} ref={timelineScrollRef}>
+              {showProjectHero ? (
+                <div className="project-hero">我们应该在{selectedProject?.name ?? '项目'}中做些什么？</div>
               ) : null}
+              {!showProjectHero && visibleTimeline.length === 0 && !waitingForReply ? (
+                <div className="rail-empty">开始一个新对话，或从左侧选择历史会话。</div>
+              ) : null}
+              {renderedTimeline}
+              {showThinkingShimmer ? <ThinkingShimmer /> : null}
+              {replyHint && waitingForReply ? <div className="composer-hint">{replyHint}</div> : null}
               {pendingApprovals.length > 0 && (
                 <div className="approval-stack">
                   {pendingApprovals.map((approval) => (
@@ -2798,8 +3527,8 @@ export default function App() {
                       </div>
                       <pre>{toPretty(approval.params)}</pre>
                       <div className="approval-actions">
-                        <button onClick={() => answerApproval(approval, false)}>拒绝</button>
-                        <button onClick={() => answerApproval(approval, true)}>同意一次</button>
+                        <button onClick={() => answerApproval(approval, false)} type="button">拒绝</button>
+                        <button onClick={() => answerApproval(approval, true)} type="button">同意一次</button>
                       </div>
                     </div>
                   ))}
@@ -2811,312 +3540,26 @@ export default function App() {
               waitingForReply={waitingForReply}
               streamingText={streamingText}
               replyHint={replyHint}
-              sessionMode={sessionMode}
-              onSessionModeChange={setSessionMode}
+              connected={status.running}
+              projectName={selectedProject?.name ?? null}
+              draftMode={draftMode}
+              models={modelOptions}
+              selectedModel={selectedModel}
+              selectedEffort={selectedEffort}
+              permissionMode={permissionMode}
+              planMode={planMode}
+              goalMode={goalMode}
+              onModelChange={handleModelChange}
+              onEffortChange={handleEffortChange}
+              onPermissionModeChange={(mode) => void handlePermissionModeChange(mode)}
+              onPlanModeChange={setPlanMode}
+              onGoalModeChange={setGoalMode}
+              onOpenSettings={() => setSettingsOpen(true)}
+              onOpenPlugins={() => setSettingsOpen(true)}
               onSend={sendPrompt}
               onNewThread={startThread}
             />
           </div>
-
-          <aside className="panel detail guard-panel">
-            <div className="panel-title">核心能力保障</div>
-            <div className="guard-card">
-              <CheckCircle2 size={16} />
-              <div>
-                <strong>对话服务</strong>
-                <span>{status.running ? '已连接官方 app-server' : '未连接'}</span>
-              </div>
-            </div>
-            <div className="guard-card">
-              <Sparkles size={16} />
-              <div>
-                <strong>Skill</strong>
-                <span>{skills.length > 0 ? `${skills.length} 个可用` : '等待刷新'}</span>
-              </div>
-            </div>
-            <div className="guard-card">
-              <Puzzle size={16} />
-              <div>
-                <strong>MCP</strong>
-                <span>{mcpServers.length > 0 ? `${mcpServers.length} 个服务器` : '等待刷新'}</span>
-              </div>
-            </div>
-            <div className="guard-card">
-              <ShieldCheck size={16} />
-              <div>
-                <strong>审批请求</strong>
-                <span>{pendingApprovals.length > 0 ? `${pendingApprovals.length} 项待处理` : '无待处理项'}</span>
-              </div>
-            </div>
-
-            <div className="panel-title secondary">Skill 列表</div>
-            <InventoryList items={skills} emptyText="启动服务后刷新 Skill" />
-
-            <div className="panel-title secondary">MCP 状态</div>
-            <InventoryList items={mcpServers} emptyText="启动服务后刷新 MCP" />
-            <div className="panel-title secondary">MCP 调试入口</div>
-            <div className="terminal-box">
-              <div className="terminal-row">
-                <input
-                  className="terminal-input"
-                  value={mcpReadServer}
-                  onChange={(e) => setMcpReadServer(e.target.value)}
-                  placeholder="resource server"
-                />
-                <input
-                  className="terminal-input"
-                  value={mcpReadUri}
-                  onChange={(e) => setMcpReadUri(e.target.value)}
-                  placeholder="resource uri"
-                />
-              </div>
-              <div className="terminal-actions">
-                <button className="terminal-run" onClick={mcpReadResource} disabled={busy}>
-                  读取资源
-                </button>
-              </div>
-              <div className="terminal-row">
-                <input
-                  className="terminal-input"
-                  value={mcpToolServer}
-                  onChange={(e) => setMcpToolServer(e.target.value)}
-                  placeholder="tool server"
-                />
-                <input
-                  className="terminal-input"
-                  value={mcpToolName}
-                  onChange={(e) => setMcpToolName(e.target.value)}
-                  placeholder="tool name"
-                />
-              </div>
-              <textarea
-                className="settings-editor"
-                value={mcpToolArgs}
-                onChange={(e) => setMcpToolArgs(e.target.value)}
-                rows={4}
-                spellCheck={false}
-              />
-              <div className="terminal-actions">
-                <button className="terminal-run" onClick={mcpCallTool} disabled={busy || !threadId}>
-                  调用工具
-                </button>
-              </div>
-            </div>
-
-            <div className="panel-title secondary">当前会话</div>
-            <div className="status-line">会话 ID：{threadId ?? '未创建'}</div>
-            <div className="status-line">传输：{status.transport}</div>
-            <div className="status-line">初始化：{status.initialized ? '已完成' : '未完成'}</div>
-            {status.last_error && <div className="status-line error-text">{status.last_error}</div>}
-
-            <div className="panel-title secondary">会话目标（thread/goal）</div>
-            <div className="terminal-box">
-              <input
-                className="terminal-input"
-                value={goalObjective}
-                onChange={(e) => setGoalObjective(e.target.value)}
-                placeholder="objective"
-              />
-              <div className="terminal-row">
-                <select className="terminal-input" value={goalStatus} onChange={(e) => setGoalStatus(e.target.value)}>
-                  <option value="active">active</option>
-                  <option value="paused">paused</option>
-                  <option value="blocked">blocked</option>
-                  <option value="usageLimited">usageLimited</option>
-                  <option value="budgetLimited">budgetLimited</option>
-                  <option value="complete">complete</option>
-                </select>
-                <input
-                  className="terminal-input"
-                  value={goalTokenBudget}
-                  onChange={(e) => setGoalTokenBudget(e.target.value)}
-                  placeholder="tokenBudget"
-                />
-              </div>
-              <div className="terminal-actions">
-                <button className="terminal-run" onClick={() => setCurrentThreadGoal()} disabled={!threadId}>设置</button>
-                <button className="terminal-run" onClick={getCurrentThreadGoal} disabled={!threadId}>读取</button>
-                <button className="terminal-run danger" onClick={clearCurrentThreadGoal} disabled={!threadId}>清空</button>
-              </div>
-            </div>
-
-            <div className="panel-title secondary">会话元数据（thread/metadata）</div>
-            <div className="terminal-box">
-              <input
-                className="terminal-input"
-                value={metadataBranch}
-                onChange={(e) => setMetadataBranch(e.target.value)}
-                placeholder="git branch"
-              />
-              <label className="status-line">
-                <input type="checkbox" checked={clearMetadataBranch} onChange={(e) => setClearMetadataBranch(e.target.checked)} />
-                清空 branch（null）
-              </label>
-              <input
-                className="terminal-input"
-                value={metadataSha}
-                onChange={(e) => setMetadataSha(e.target.value)}
-                placeholder="git sha"
-              />
-              <label className="status-line">
-                <input type="checkbox" checked={clearMetadataSha} onChange={(e) => setClearMetadataSha(e.target.checked)} />
-                清空 sha（null）
-              </label>
-              <input
-                className="terminal-input"
-                value={metadataOrigin}
-                onChange={(e) => setMetadataOrigin(e.target.value)}
-                placeholder="git origin url"
-              />
-              <label className="status-line">
-                <input type="checkbox" checked={clearMetadataOrigin} onChange={(e) => setClearMetadataOrigin(e.target.checked)} />
-                清空 originUrl（null）
-              </label>
-              <div className="terminal-actions">
-                <button className="terminal-run" onClick={() => updateCurrentThreadMetadataGit()} disabled={!threadId}>
-                  更新 metadata
-                </button>
-              </div>
-              <pre className="terminal-log">
-                {threadGitInfo
-                  ? `branch: ${threadGitInfo.branch ?? '(null)'}\nsha: ${threadGitInfo.sha ?? '(null)'}\norigin: ${threadGitInfo.originUrl ?? '(null)'}`
-                  : '暂无 thread gitInfo'}
-              </pre>
-            </div>
-
-            <div className="panel-title secondary">会话设置（thread/settings）</div>
-            <div className="terminal-box">
-              <pre className="terminal-log">{threadSettingsView ? JSON.stringify(threadSettingsView, null, 2) : '暂无 thread settings（等待 thread/settings/updated 或 thread/read 返回）'}</pre>
-            </div>
-
-            <div className="panel-title secondary">终端（只读）</div>
-            <div className="terminal-box">
-              <div className="terminal-row">
-                <input className="terminal-input" value={terminalCommand} onChange={(e) => setTerminalCommand(e.target.value)} />
-                <button className="terminal-run" onClick={runTerminalCommand} disabled={busy}>运行</button>
-              </div>
-              <pre className="terminal-log">{terminalLog || '可用命令：pwd / ls / git status --short / git branch --show-current'}</pre>
-            </div>
-
-            <div className="panel-title secondary">官方 command/exec</div>
-            <div className="terminal-box">
-              <div className="terminal-row">
-                <label className="status-line">
-                  <input type="checkbox" checked={execTty} onChange={(e) => setExecTty(e.target.checked)} />
-                  启用 TTY
-                </label>
-                <input
-                  className="terminal-input"
-                  type="number"
-                  min={1}
-                  value={execCols}
-                  onChange={(e) => setExecCols(Number(e.target.value) || 1)}
-                  placeholder="cols"
-                />
-                <input
-                  className="terminal-input"
-                  type="number"
-                  min={1}
-                  value={execRows}
-                  onChange={(e) => setExecRows(Number(e.target.value) || 1)}
-                  placeholder="rows"
-                />
-                <button className="terminal-run" onClick={resizeExecCommand} disabled={!execRunning || !execProcessId || !execTty}>
-                  调整尺寸
-                </button>
-              </div>
-              <div className="terminal-row">
-                <input
-                  className="terminal-input"
-                  value={execCommand}
-                  onChange={(e) => setExecCommand(e.target.value)}
-                  placeholder="例如：ls -la"
-                />
-                <button className="terminal-run" onClick={startExecCommand} disabled={busy || execRunning}>
-                  运行
-                </button>
-              </div>
-              <div className="terminal-row">
-                <input
-                  className="terminal-input"
-                  value={execStdin}
-                  onChange={(e) => setExecStdin(e.target.value)}
-                  placeholder="stdin 文本（可选）"
-                />
-                <button className="terminal-run" onClick={() => writeExecStdin(false)} disabled={!execRunning || !execProcessId}>
-                  写入
-                </button>
-                <button className="terminal-run" onClick={() => writeExecStdin(true)} disabled={!execRunning || !execProcessId}>
-                  关闭 stdin
-                </button>
-                <button className="terminal-run danger" onClick={stopExecCommand} disabled={!execRunning || !execProcessId}>
-                  终止
-                </button>
-              </div>
-              <pre className="terminal-log">{execLog || '暂无 command/exec 输出'}</pre>
-            </div>
-
-            {diffOpen && (
-              <>
-                <div className="panel-title secondary">Diff（未提交）</div>
-                <div className="terminal-box">
-                  <pre className="terminal-log">{gitStatusShort || '工作区干净'}</pre>
-                  <div className="terminal-actions">
-                    <button className="terminal-run" onClick={refreshDiff} disabled={busy}>刷新 diff</button>
-                    <button className="terminal-run" onClick={stageAllChanges} disabled={busy}>暂存全部</button>
-                    <button className="terminal-run" onClick={unstageAllChanges} disabled={busy}>取消暂存</button>
-                    <button className="terminal-run danger" onClick={revertAllChanges} disabled={busy}>回退工作区</button>
-                    <button className="terminal-run" onClick={() => setDiffOpen(false)} disabled={busy}>关闭</button>
-                  </div>
-                  <div className="panel-title secondary">已暂存 Diff</div>
-                  <pre className="terminal-log">{stagedDiffText || '无已暂存 diff'}</pre>
-                  <div className="panel-title secondary">未暂存 Diff</div>
-                  <pre className="terminal-log">{diffText || '无未暂存 diff'}</pre>
-                  <div className="panel-title secondary">按文件操作</div>
-                  <div className="file-actions">
-                    {changedFiles.length === 0 ? (
-                      <div className="empty-state">暂无变更文件</div>
-                    ) : (
-                      changedFiles.map((file) => {
-                        const staged = file.index_status && file.index_status !== '?';
-                        const untracked = file.index_status === '?' && file.worktree_status === '?';
-                        return (
-                          <div key={file.path} className="file-row">
-                            <div className="file-main">
-                              <code>{file.path}</code>
-                              <small>index:{file.index_status || '-'} worktree:{file.worktree_status || '-'}</small>
-                            </div>
-                            <div className="file-row-actions">
-                              <button className="terminal-run" onClick={() => stagePath(file.path)} disabled={busy}>
-                                暂存
-                              </button>
-                              <button className="terminal-run" onClick={() => unstagePath(file.path)} disabled={busy || !staged}>
-                                取消暂存
-                              </button>
-                              <button className="terminal-run danger" onClick={() => revertPath(file.path)} disabled={busy || untracked}>
-                                回退
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                  <div className="commit-row">
-                    <input
-                      className="terminal-input"
-                      value={commitMessage}
-                      onChange={(e) => setCommitMessage(e.target.value)}
-                      placeholder="提交信息，例如：feat: 完善暂存与提交工作流"
-                    />
-                    <button className="terminal-run" onClick={commitAllChanges} disabled={busy || !commitMessage.trim()}>
-                      提交
-                    </button>
-                  </div>
-                </div>
-              </>
-            )}
-          </aside>
         </section>
 
         {settingsOpen && (
@@ -3169,10 +3612,79 @@ export default function App() {
                 <button onClick={refreshEnterpriseCapabilities} disabled={busy}>刷新 Skills / MCP</button>
               </div>
               <div className="settings-inventory">
-                <div className="panel-title secondary">技能（{skills.length}）</div>
+                <div className="rail-section-title">技能（{skills.length}）</div>
                 <InventoryList items={skills} emptyText="暂无 Skill" />
-                <div className="panel-title secondary">MCP（{mcpServers.length}）</div>
+                <div className="rail-section-title">MCP（{mcpServers.length}）</div>
                 <InventoryList items={mcpServers} emptyText="暂无 MCP 服务器" />
+              </div>
+
+              <div className="dev-tools-section">
+                <h3>会话与开发工具</h3>
+                <div className="settings-actions">
+                  <button onClick={() => setSessionMode('local')} type="button">Local 模式</button>
+                  <button onClick={() => setSessionMode('worktree')} type="button">Worktree 模式</button>
+                  <button onClick={startReview} disabled={busy || (codexCheck ? !codexCheck.installed : false)} type="button">/review</button>
+                  <button onClick={() => { setDiffOpen(true); void refreshDiff(); }} disabled={busy} type="button">Diff</button>
+                  <button
+                    onClick={() => {
+                      const next = window.prompt('输入新的会话名称');
+                      if (next) renameCurrentThread(next);
+                    }}
+                    disabled={!threadId}
+                    type="button"
+                  >
+                    重命名
+                  </button>
+                  <button onClick={forkCurrentThread} disabled={!threadId} type="button">分叉</button>
+                  <button onClick={archiveCurrentThread} disabled={!threadId} type="button">归档</button>
+                </div>
+                <div className="status-line">会话 ID：{threadId ?? '未创建'}</div>
+                <div className="status-line">传输：{status.transport}</div>
+                <div className="status-line">初始化：{status.initialized ? '已完成' : '未完成'}</div>
+
+                <div className="rail-section-title">MCP 调试</div>
+                <div className="terminal-box">
+                  <div className="terminal-row">
+                    <input className="terminal-input" value={mcpReadServer} onChange={(e) => setMcpReadServer(e.target.value)} placeholder="resource server" />
+                    <input className="terminal-input" value={mcpReadUri} onChange={(e) => setMcpReadUri(e.target.value)} placeholder="resource uri" />
+                  </div>
+                  <div className="terminal-actions">
+                    <button className="terminal-run" onClick={mcpReadResource} disabled={busy} type="button">读取资源</button>
+                  </div>
+                  <div className="terminal-row">
+                    <input className="terminal-input" value={mcpToolServer} onChange={(e) => setMcpToolServer(e.target.value)} placeholder="tool server" />
+                    <input className="terminal-input" value={mcpToolName} onChange={(e) => setMcpToolName(e.target.value)} placeholder="tool name" />
+                  </div>
+                  <textarea className="settings-editor" value={mcpToolArgs} onChange={(e) => setMcpToolArgs(e.target.value)} rows={4} spellCheck={false} />
+                  <div className="terminal-actions">
+                    <button className="terminal-run" onClick={mcpCallTool} disabled={busy || !threadId} type="button">调用工具</button>
+                  </div>
+                </div>
+
+                <div className="rail-section-title">终端（只读）</div>
+                <div className="terminal-box">
+                  <div className="terminal-row">
+                    <input className="terminal-input" value={terminalCommand} onChange={(e) => setTerminalCommand(e.target.value)} />
+                    <button className="terminal-run" onClick={runTerminalCommand} disabled={busy} type="button">运行</button>
+                  </div>
+                  <pre className="terminal-log">{terminalLog || '可用命令：pwd / ls / git status --short / git branch --show-current'}</pre>
+                </div>
+
+                {diffOpen ? (
+                  <>
+                    <div className="rail-section-title">Git Diff</div>
+                    <div className="terminal-box">
+                      <pre className="terminal-log">{gitStatusShort || '工作区干净'}</pre>
+                      <div className="terminal-actions">
+                        <button className="terminal-run" onClick={refreshDiff} disabled={busy} type="button">刷新</button>
+                        <button className="terminal-run" onClick={stageAllChanges} disabled={busy} type="button">暂存全部</button>
+                        <button className="terminal-run" onClick={unstageAllChanges} disabled={busy} type="button">取消暂存</button>
+                        <button className="terminal-run" onClick={() => setDiffOpen(false)} disabled={busy} type="button">关闭</button>
+                      </div>
+                      <pre className="terminal-log">{stagedDiffText || diffText || '无 diff'}</pre>
+                    </div>
+                  </>
+                ) : null}
               </div>
             </div>
           </div>

@@ -11,6 +11,7 @@ pub struct ProjectRow {
   pub path: String,
   pub name: String,
   pub created_at: i64,
+  pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub struct SessionRow {
   pub title: Option<String>,
   pub updated_at: Option<i64>,
   pub status: Option<String>,
+  pub pinned: bool,
 }
 
 fn open_conn(db_path: &Path) -> Result<Connection, String> {
@@ -64,16 +66,66 @@ CREATE INDEX IF NOT EXISTS idx_sessions_project_updated
   let _ = conn.execute("ALTER TABLE projects ADD COLUMN last_opened_at INTEGER", []);
   let _ = conn.execute("ALTER TABLE sessions ADD COLUMN mode TEXT", []);
   let _ = conn.execute("ALTER TABLE sessions ADD COLUMN worktree_path TEXT", []);
+  let _ = conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []);
+  let _ = conn.execute("ALTER TABLE projects ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []);
 
   Ok(())
 }
 
 pub fn rename_project(db: &DbPath, project_id: i64, name: String) -> Result<(), String> {
+  let trimmed = name.trim();
+  if trimmed.is_empty() {
+    return Err("项目名称不能为空".to_string());
+  }
   let conn = open_conn(&db.0)?;
   conn
-    .execute("UPDATE projects SET name=?2 WHERE id=?1", params![project_id, name])
+    .execute("UPDATE projects SET name=?2 WHERE id=?1", params![project_id, trimmed])
     .map_err(|e| format!("rename project failed: {e}"))?;
   Ok(())
+}
+
+pub fn set_project_pinned(db: &DbPath, project_id: i64, pinned: bool) -> Result<ProjectRow, String> {
+  let conn = open_conn(&db.0)?;
+  let pinned_value = if pinned { 1 } else { 0 };
+  let updated = conn
+    .execute(
+      "UPDATE projects SET pinned=?2 WHERE id=?1",
+      params![project_id, pinned_value],
+    )
+    .map_err(|e| format!("set project pinned failed: {e}"))?;
+  if updated == 0 {
+    return Err("project not found".to_string());
+  }
+  get_project_by_id(db, project_id)
+}
+
+pub fn remove_project(db: &DbPath, project_id: i64) -> Result<(), String> {
+  let conn = open_conn(&db.0)?;
+  conn
+    .execute("DELETE FROM projects WHERE id=?1", params![project_id])
+    .map_err(|e| format!("remove project failed: {e}"))?;
+  Ok(())
+}
+
+fn get_project_by_id(db: &DbPath, project_id: i64) -> Result<ProjectRow, String> {
+  let conn = open_conn(&db.0)?;
+  conn
+    .query_row(
+      "SELECT id, path, name, created_at, pinned FROM projects WHERE id=?1",
+      params![project_id],
+      |row| map_project_row(row),
+    )
+    .map_err(|e| format!("project not found: {e}"))
+}
+
+fn map_project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
+  Ok(ProjectRow {
+    id: row.get(0)?,
+    path: row.get(1)?,
+    name: row.get(2)?,
+    created_at: row.get(3)?,
+    pinned: row.get::<_, i64>(4)? != 0,
+  })
 }
 
 fn normalize_path(raw: &str) -> Result<String, String> {
@@ -94,6 +146,13 @@ fn default_project_name(path: &str) -> String {
 
 pub fn add_project(db: &DbPath, path: String, name: Option<String>, now: i64) -> Result<ProjectRow, String> {
   let path = normalize_path(&path)?;
+  let p = Path::new(&path);
+  if !p.exists() {
+    return Err(format!("目录不存在: {path}"));
+  }
+  if !p.is_dir() {
+    return Err(format!("路径不是文件夹: {path}"));
+  }
   let display_name = name.clone().unwrap_or_else(|| default_project_name(&path));
 
   let conn = open_conn(&db.0)?;
@@ -117,17 +176,12 @@ pub fn add_project(db: &DbPath, path: String, name: Option<String>, now: i64) ->
 pub fn list_projects(db: &DbPath) -> Result<Vec<ProjectRow>, String> {
   let conn = open_conn(&db.0)?;
   let mut stmt = conn
-    .prepare("SELECT id, path, name, created_at FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC")
+    .prepare(
+      "SELECT id, path, name, created_at, pinned FROM projects ORDER BY pinned DESC, COALESCE(last_opened_at, created_at) DESC",
+    )
     .map_err(|e| format!("prepare list projects failed: {e}"))?;
   let rows = stmt
-    .query_map([], |row| {
-      Ok(ProjectRow {
-        id: row.get(0)?,
-        path: row.get(1)?,
-        name: row.get(2)?,
-        created_at: row.get(3)?,
-      })
-    })
+    .query_map([], map_project_row)
     .map_err(|e| format!("query list projects failed: {e}"))?;
   Ok(rows.filter_map(Result::ok).collect())
 }
@@ -136,16 +190,9 @@ pub fn get_project_by_path(db: &DbPath, path: &str) -> Result<ProjectRow, String
   let conn = open_conn(&db.0)?;
   conn
     .query_row(
-      "SELECT id, path, name, created_at FROM projects WHERE path=?1",
+      "SELECT id, path, name, created_at, pinned FROM projects WHERE path=?1",
       params![path],
-      |row| {
-        Ok(ProjectRow {
-          id: row.get(0)?,
-          path: row.get(1)?,
-          name: row.get(2)?,
-          created_at: row.get(3)?,
-        })
-      },
+      map_project_row,
     )
     .map_err(|e| format!("project not found: {e}"))
 }
@@ -179,7 +226,7 @@ ON CONFLICT(project_id, thread_id) DO UPDATE SET
 
   conn
     .query_row(
-      "SELECT id, project_id, thread_id, mode, worktree_path, title, updated_at, status FROM sessions WHERE project_id=?1 AND thread_id=?2",
+      "SELECT id, project_id, thread_id, mode, worktree_path, title, updated_at, status, pinned FROM sessions WHERE project_id=?1 AND thread_id=?2",
       params![project_id, thread_id],
       |row| {
         Ok(SessionRow {
@@ -191,6 +238,7 @@ ON CONFLICT(project_id, thread_id) DO UPDATE SET
           title: row.get(5)?,
           updated_at: row.get(6)?,
           status: row.get(7)?,
+          pinned: row.get::<_, i64>(8)? != 0,
         })
       },
     )
@@ -201,7 +249,7 @@ pub fn list_sessions_for_project(db: &DbPath, project_id: i64) -> Result<Vec<Ses
   let conn = open_conn(&db.0)?;
   let mut stmt = conn
     .prepare(
-      "SELECT id, project_id, thread_id, mode, worktree_path, title, updated_at, status FROM sessions WHERE project_id=?1 ORDER BY COALESCE(updated_at, 0) DESC, id DESC",
+      "SELECT id, project_id, thread_id, mode, worktree_path, title, updated_at, status, pinned FROM sessions WHERE project_id=?1 ORDER BY pinned DESC, COALESCE(updated_at, 0) DESC, id DESC",
     )
     .map_err(|e| format!("prepare list sessions failed: {e}"))?;
   let rows = stmt
@@ -215,10 +263,60 @@ pub fn list_sessions_for_project(db: &DbPath, project_id: i64) -> Result<Vec<Ses
         title: row.get(5)?,
         updated_at: row.get(6)?,
         status: row.get(7)?,
+        pinned: row.get::<_, i64>(8)? != 0,
       })
     })
     .map_err(|e| format!("query list sessions failed: {e}"))?;
   Ok(rows.filter_map(Result::ok).collect())
+}
+
+pub fn set_session_pinned(
+  db: &DbPath,
+  project_id: i64,
+  thread_id: String,
+  pinned: bool,
+) -> Result<SessionRow, String> {
+  let conn = open_conn(&db.0)?;
+  let pinned_value = if pinned { 1 } else { 0 };
+  let updated = conn
+    .execute(
+      "UPDATE sessions SET pinned=?3 WHERE project_id=?1 AND thread_id=?2",
+      params![project_id, thread_id, pinned_value],
+    )
+    .map_err(|e| format!("set session pinned failed: {e}"))?;
+  if updated == 0 {
+    return Err("session not found".to_string());
+  }
+  conn
+    .query_row(
+      "SELECT id, project_id, thread_id, mode, worktree_path, title, updated_at, status, pinned FROM sessions WHERE project_id=?1 AND thread_id=?2",
+      params![project_id, thread_id],
+      |row| {
+        Ok(SessionRow {
+          id: row.get(0)?,
+          project_id: row.get(1)?,
+          thread_id: row.get(2)?,
+          mode: row.get(3)?,
+          worktree_path: row.get(4)?,
+          title: row.get(5)?,
+          updated_at: row.get(6)?,
+          status: row.get(7)?,
+          pinned: row.get::<_, i64>(8)? != 0,
+        })
+      },
+    )
+    .map_err(|e| format!("read session after pin failed: {e}"))
+}
+
+pub fn delete_session(db: &DbPath, project_id: i64, thread_id: String) -> Result<(), String> {
+  let conn = open_conn(&db.0)?;
+  conn
+    .execute(
+      "DELETE FROM sessions WHERE project_id=?1 AND thread_id=?2",
+      params![project_id, thread_id],
+    )
+    .map_err(|e| format!("delete session failed: {e}"))?;
+  Ok(())
 }
 
 pub fn touch_project(db: &DbPath, project_id: i64, now: i64) -> Result<(), String> {

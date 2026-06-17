@@ -206,7 +206,7 @@ Make sure `codex` is installed and available on PATH."
       json!({
         "clientInfo": {
           "name": name,
-          "title": "Codex Tauri Client",
+          "title": "鱼泡codex",
           "version": env!("CARGO_PKG_VERSION")
         },
         "capabilities": {
@@ -224,12 +224,27 @@ Make sure `codex` is installed and available on PATH."
     Ok(id)
   }
 
-  pub fn start_thread(&self, cwd: Option<String>, model: Option<String>) -> Result<u64, String> {
-    self.send_thread_start(cwd, model)
+  pub fn start_thread(
+    &self,
+    cwd: Option<String>,
+    model: Option<String>,
+    approval_policy: Option<Value>,
+    approvals_reviewer: Option<String>,
+    sandbox: Option<String>,
+  ) -> Result<u64, String> {
+    self.send_thread_start(cwd, model, approval_policy, approvals_reviewer, sandbox)
   }
 
-  pub fn start_thread_sync(&self, cwd: Option<String>, model: Option<String>, timeout_secs: u64) -> Result<String, String> {
-    let request_id = self.send_thread_start(cwd, model)?;
+  pub fn start_thread_sync(
+    &self,
+    cwd: Option<String>,
+    model: Option<String>,
+    approval_policy: Option<Value>,
+    approvals_reviewer: Option<String>,
+    sandbox: Option<String>,
+    timeout_secs: u64,
+  ) -> Result<String, String> {
+    let request_id = self.send_thread_start(cwd, model, approval_policy, approvals_reviewer, sandbox)?;
     let (tx, rx) = mpsc::channel();
     self
       .response_waiters
@@ -242,7 +257,14 @@ Make sure `codex` is installed and available on PATH."
     thread_id_from_envelope(&envelope)
   }
 
-  fn send_thread_start(&self, cwd: Option<String>, model: Option<String>) -> Result<u64, String> {
+  fn send_thread_start(
+    &self,
+    cwd: Option<String>,
+    model: Option<String>,
+    approval_policy: Option<Value>,
+    approvals_reviewer: Option<String>,
+    sandbox: Option<String>,
+  ) -> Result<u64, String> {
     let mut params = json!({
       "developerInstructions": "你是企业聊天客户端。优先直接回答用户问题；仅在用户明确要求时使用技能、工具或 MCP。简单对话不要加载或执行技能流程。",
       "personality": "pragmatic"
@@ -252,6 +274,15 @@ Make sure `codex` is installed and available on PATH."
     }
     if let Some(model) = model {
       params["model"] = Value::String(model);
+    }
+    if let Some(approval_policy) = approval_policy {
+      params["approvalPolicy"] = approval_policy;
+    }
+    if let Some(approvals_reviewer) = approvals_reviewer {
+      params["approvalsReviewer"] = Value::String(approvals_reviewer);
+    }
+    if let Some(sandbox) = sandbox {
+      params["sandbox"] = Value::String(sandbox);
     }
     self.send_request("thread/start", params)
   }
@@ -307,16 +338,98 @@ Make sure `codex` is installed and available on PATH."
       .ok_or_else(|| "thread/read returned no result".to_string())
   }
 
-  pub fn start_turn(&self, thread_id: String, text: String, cwd: Option<String>) -> Result<u64, String> {
+  pub fn start_turn(
+    &self,
+    thread_id: String,
+    text: Option<String>,
+    input: Option<Value>,
+    cwd: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    approval_policy: Option<Value>,
+    approvals_reviewer: Option<String>,
+    sandbox_policy: Option<Value>,
+  ) -> Result<u64, String> {
+    let input_value = if let Some(input) = input {
+      input
+    } else if let Some(text) = text {
+      json!([{ "type": "text", "text": text, "text_elements": [] }])
+    } else {
+      return Err("turn/start requires text or input".to_string());
+    };
+
     let mut params = json!({
       "threadId": thread_id,
-      "input": [{ "type": "text", "text": text }],
+      "input": input_value,
       "developerInstructions": "优先直接回答。仅在用户明确要求时使用技能、工具或 MCP。"
     });
     if let Some(cwd) = cwd {
       params["cwd"] = Value::String(cwd);
     }
+    if let Some(model) = model {
+      params["model"] = Value::String(model);
+    }
+    if let Some(effort) = effort {
+      params["effort"] = Value::String(effort);
+    }
+    if let Some(approval_policy) = approval_policy {
+      params["approvalPolicy"] = approval_policy;
+    }
+    if let Some(approvals_reviewer) = approvals_reviewer {
+      params["approvalsReviewer"] = Value::String(approvals_reviewer);
+    }
+    if let Some(sandbox_policy) = sandbox_policy {
+      params["sandboxPolicy"] = sandbox_policy;
+    }
     self.send_request("turn/start", params)
+  }
+
+  pub fn update_thread_settings(
+    &self,
+    thread_id: String,
+    thread_settings: Value,
+    timeout_secs: u64,
+  ) -> Result<Value, String> {
+    let mut params = match thread_settings {
+      Value::Object(map) => map,
+      _ => serde_json::Map::new(),
+    };
+    params.insert("threadId".to_string(), Value::String(thread_id));
+    let request_id = self.send_request("thread/settings/update", Value::Object(params))?;
+    let (tx, rx) = mpsc::channel();
+    self
+      .response_waiters
+      .lock()
+      .map_err(lock_error)?
+      .insert(request_id, tx);
+    let envelope = rx
+      .recv_timeout(Duration::from_secs(timeout_secs))
+      .map_err(|_| format!("thread/settings/update timed out after {timeout_secs}s"))?;
+    if let Some(error) = &envelope.error {
+      return Err(error.to_string());
+    }
+    envelope
+      .result
+      .ok_or_else(|| "thread/settings/update returned no result".to_string())
+  }
+
+  pub fn list_models_sync(&self, timeout_secs: u64) -> Result<Value, String> {
+    let request_id = self.send_request("model/list", json!({ "limit": 50 }))?;
+    let (tx, rx) = mpsc::channel();
+    self
+      .response_waiters
+      .lock()
+      .map_err(lock_error)?
+      .insert(request_id, tx);
+    let envelope = rx
+      .recv_timeout(Duration::from_secs(timeout_secs))
+      .map_err(|_| format!("model/list timed out after {timeout_secs}s"))?;
+    if let Some(error) = &envelope.error {
+      return Err(error.to_string());
+    }
+    envelope
+      .result
+      .ok_or_else(|| "model/list returned no result".to_string())
   }
 
   pub fn steer_turn(&self, thread_id: String, text: String) -> Result<u64, String> {

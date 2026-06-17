@@ -43,13 +43,27 @@ fn codex_initialize(state: State<'_, SharedCodexBridge>, client_name: Option<Str
 }
 
 #[tauri::command]
-fn codex_start_thread(state: State<'_, SharedCodexBridge>, cwd: Option<String>, model: Option<String>) -> Result<u64, String> {
-  state.0.start_thread(cwd, model)
+fn codex_start_thread(
+  state: State<'_, SharedCodexBridge>,
+  cwd: Option<String>,
+  model: Option<String>,
+  approval_policy: Option<serde_json::Value>,
+  approvals_reviewer: Option<String>,
+  sandbox: Option<String>,
+) -> Result<u64, String> {
+  state.0.start_thread(cwd, model, approval_policy, approvals_reviewer, sandbox)
 }
 
 #[tauri::command]
-fn codex_start_thread_sync(state: State<'_, SharedCodexBridge>, cwd: Option<String>, model: Option<String>) -> Result<String, String> {
-  state.0.start_thread_sync(cwd, model, 120)
+fn codex_start_thread_sync(
+  state: State<'_, SharedCodexBridge>,
+  cwd: Option<String>,
+  model: Option<String>,
+  approval_policy: Option<serde_json::Value>,
+  approvals_reviewer: Option<String>,
+  sandbox: Option<String>,
+) -> Result<String, String> {
+  state.0.start_thread_sync(cwd, model, approval_policy, approvals_reviewer, sandbox, 120)
 }
 
 #[tauri::command]
@@ -73,8 +87,43 @@ fn codex_read_thread_sync(state: State<'_, SharedCodexBridge>, thread_id: String
 }
 
 #[tauri::command]
-fn codex_start_turn(state: State<'_, SharedCodexBridge>, thread_id: String, text: String, cwd: Option<String>) -> Result<u64, String> {
-  state.0.start_turn(thread_id, text, cwd)
+fn codex_start_turn(
+  state: State<'_, SharedCodexBridge>,
+  thread_id: String,
+  text: Option<String>,
+  input: Option<serde_json::Value>,
+  cwd: Option<String>,
+  model: Option<String>,
+  effort: Option<String>,
+  approval_policy: Option<serde_json::Value>,
+  approvals_reviewer: Option<String>,
+  sandbox_policy: Option<serde_json::Value>,
+) -> Result<u64, String> {
+  state.0.start_turn(
+    thread_id,
+    text,
+    input,
+    cwd,
+    model,
+    effort,
+    approval_policy,
+    approvals_reviewer,
+    sandbox_policy,
+  )
+}
+
+#[tauri::command]
+fn codex_update_thread_settings(
+  state: State<'_, SharedCodexBridge>,
+  thread_id: String,
+  thread_settings: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+  state.0.update_thread_settings(thread_id, thread_settings, 30)
+}
+
+#[tauri::command]
+fn codex_list_models_sync(state: State<'_, SharedCodexBridge>) -> Result<serde_json::Value, String> {
+  state.0.list_models_sync(30)
 }
 
 #[tauri::command]
@@ -368,6 +417,21 @@ fn session_upsert(
 }
 
 #[tauri::command]
+fn session_set_pinned(
+  state: State<'_, SharedDb>,
+  project_id: i64,
+  thread_id: String,
+  pinned: bool,
+) -> Result<SessionRow, String> {
+  db::set_session_pinned(&state.0, project_id, thread_id, pinned)
+}
+
+#[tauri::command]
+fn session_delete(state: State<'_, SharedDb>, project_id: i64, thread_id: String) -> Result<(), String> {
+  db::delete_session(&state.0, project_id, thread_id)
+}
+
+#[tauri::command]
 fn worktree_create(app: AppHandle, project_path: String, session_thread_id: String) -> Result<String, String> {
   let app_data_dir = app
     .path()
@@ -416,6 +480,53 @@ fn project_rename(state: State<'_, SharedDb>, project_id: i64, name: String) -> 
   db::rename_project(&state.0, project_id, name)
 }
 
+#[tauri::command]
+fn project_set_pinned(state: State<'_, SharedDb>, project_id: i64, pinned: bool) -> Result<ProjectRow, String> {
+  db::set_project_pinned(&state.0, project_id, pinned)
+}
+
+#[tauri::command]
+fn project_remove(state: State<'_, SharedDb>, project_id: i64) -> Result<(), String> {
+  db::remove_project(&state.0, project_id)
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+  let trimmed = path.trim();
+  if trimmed.is_empty() {
+    return Err("路径不能为空".to_string());
+  }
+  if !std::path::Path::new(trimmed).exists() {
+    return Err(format!("目录不存在: {trimmed}"));
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    std::process::Command::new("open")
+      .arg(trimmed)
+      .spawn()
+      .map_err(|e| format!("打开目录失败: {e}"))?;
+  }
+
+  #[cfg(target_os = "windows")]
+  {
+    std::process::Command::new("explorer")
+      .arg(trimmed)
+      .spawn()
+      .map_err(|e| format!("打开目录失败: {e}"))?;
+  }
+
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    std::process::Command::new("xdg-open")
+      .arg(trimmed)
+      .spawn()
+      .map_err(|e| format!("打开目录失败: {e}"))?;
+  }
+
+  Ok(())
+}
+
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
@@ -444,6 +555,8 @@ pub fn run() {
       codex_read_thread,
       codex_read_thread_sync,
       codex_start_turn,
+      codex_update_thread_settings,
+      codex_list_models_sync,
       codex_steer_turn,
       codex_interrupt_turn,
       codex_set_thread_name,
@@ -485,7 +598,12 @@ pub fn run() {
       projects_list,
       sessions_for_project,
       session_upsert,
+      session_set_pinned,
+      session_delete,
       project_rename,
+      project_set_pinned,
+      project_remove,
+      open_path,
       project_touch,
       worktree_create,
       worktree_remove,
