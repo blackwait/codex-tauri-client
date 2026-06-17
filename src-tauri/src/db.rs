@@ -61,6 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_project_updated
     .map_err(|e| format!("init sqlite schema failed: {e}"))?;
 
   // Best-effort migrations for older DBs
+  let _ = conn.execute("ALTER TABLE projects ADD COLUMN last_opened_at INTEGER", []);
   let _ = conn.execute("ALTER TABLE sessions ADD COLUMN mode TEXT", []);
   let _ = conn.execute("ALTER TABLE sessions ADD COLUMN worktree_path TEXT", []);
 

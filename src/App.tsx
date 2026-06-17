@@ -1,10 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import rehypeHighlight from 'rehype-highlight';
+// NOTE: rehype-highlight is expensive for long timelines; keep rendering lightweight.
 import {
   ArrowUp,
   CalendarClock,
@@ -62,15 +60,9 @@ type TimelineItem = {
   turnIndex?: number;
 };
 
-function MarkdownBlock({ value }: { value: string }) {
-  return (
-    <div className="md">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-        {value}
-      </ReactMarkdown>
-    </div>
-  );
-}
+const MarkdownBlock = React.memo(function MarkdownBlock({ value }: { value: string }) {
+  return <pre className="event-mono">{value}</pre>;
+});
 
 type AppServerItem = {
   id?: string;
@@ -645,7 +637,6 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [codexCheck, setCodexCheck] = useState<CodexCheckResult | null>(null);
-  const [prompt, setPrompt] = useState('');
   const [timeline, setTimeline] = useState<TimelineItem[]>([
     { id: 'boot', kind: 'system', title: '准备就绪', body: autoConnectMessage },
   ]);
@@ -696,6 +687,7 @@ export default function App() {
   const [quickSandbox, setQuickSandbox] = useState('');
   const [sessionMode, setSessionMode] = useState<SessionMode>('local');
   const pendingPromptRef = useRef<string | null>(null);
+  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const bootstrappedRef = useRef(false);
   const pendingCreateSessionProjectIdRef = useRef<number | null>(null);
   const pendingSessionModeRef = useRef<SessionMode>('local');
@@ -708,6 +700,9 @@ export default function App() {
   const latestDiffTimelineIdRef = useRef<string | null>(null);
   const execPendingRequestIdRef = useRef<number | null>(null);
   const execProcessIdRef = useRef<string | null>(null);
+  const serviceLogRef = useRef<string>('');
+  const serviceLogFlushTimerRef = useRef<number | null>(null);
+  const serviceLogPendingRef = useRef<string>('');
   const [turnIndex, setTurnIndex] = useState<number>(0);
   const [turnState, setTurnState] = useState<'idle' | 'thinking' | 'runningTools'>('idle');
   const [editingProjectId, setEditingProjectId] = useState<number | null>(null);
@@ -844,10 +839,8 @@ export default function App() {
         if (delta) {
           const prefix = params.stream === 'stderr' ? '[stderr] ' : '';
           setExecLog((prev) => `${prev}${prefix}${delta}`);
-          setTimeline((current) => [
-            ...current,
-            { id: crypto.randomUUID(), kind: 'tool', subtype: 'commandExec', title: `Exec ${processId || ''}`.trim(), body: `${prefix}${delta}` },
-          ]);
+          // Avoid appending timeline rows per chunk (hot path).
+          void processId;
         }
         return;
       }
@@ -1213,12 +1206,7 @@ export default function App() {
         if (pendingPrompt) {
           pendingPromptRef.current = null;
           invoke<number>('codex_start_turn', { threadId: nextThreadId, text: pendingPrompt, cwd: projectPathRef.current || null })
-            .then(() => {
-              setTimeline((current) => [
-                ...current,
-                { id: crypto.randomUUID(), kind: 'system', title: '用户', body: pendingPrompt },
-              ]);
-            })
+            .then(() => {})
             .catch((error) => appendError('待发送消息提交失败', error));
         }
       }
@@ -1231,10 +1219,26 @@ export default function App() {
       }
     }).then((unlisten) => unsubs.push(unlisten));
     listen<{ line: string }>('codex:stderr', (event) => {
-      setTimeline((current) => [
-        ...current,
-        { id: crypto.randomUUID(), kind: 'system', title: '服务日志', body: event.payload.line },
-      ]);
+      const line = event.payload.line;
+      if (!line) return;
+      const next = `${serviceLogPendingRef.current}${serviceLogPendingRef.current ? '\n' : ''}${line}`.split('\n').slice(-50).join('\n');
+      serviceLogPendingRef.current = next;
+      if (serviceLogFlushTimerRef.current != null) return;
+      serviceLogFlushTimerRef.current = window.setTimeout(() => {
+        serviceLogFlushTimerRef.current = null;
+        const flushed = serviceLogPendingRef.current;
+        if (!flushed || flushed === serviceLogRef.current) return;
+        serviceLogRef.current = flushed;
+        setTimeline((current) => {
+          const id = 'service-log';
+          const existingIdx = current.findIndex((it) => it.id === id);
+          const item = { id, kind: 'system' as const, title: '服务日志（最近50行）', body: flushed };
+          if (existingIdx === -1) return [...current, item];
+          const copy = current.slice();
+          copy[existingIdx] = item;
+          return copy;
+        });
+      }, 250);
     }).then((unlisten) => unsubs.push(unlisten));
     listen<{ line: string; error: string }>('codex:unparsed', (event) => {
       setTimeline((current) => [
@@ -1249,6 +1253,10 @@ export default function App() {
     }
 
     return () => {
+      if (serviceLogFlushTimerRef.current != null) {
+        window.clearTimeout(serviceLogFlushTimerRef.current);
+        serviceLogFlushTimerRef.current = null;
+      }
       unsubs.forEach((unlisten) => unlisten());
     };
   }, [projectPath]);
@@ -1378,6 +1386,10 @@ export default function App() {
   async function dispatchPromptText(text: string) {
     if (!text) return;
     setBusy(true);
+    setTimeline((current) => [
+      ...current,
+      { id: crypto.randomUUID(), kind: 'system', title: '用户', body: text },
+    ]);
     try {
       if (!(await connectCodex(false))) return;
       if (!threadId) {
@@ -1387,20 +1399,15 @@ export default function App() {
           pendingSessionModeRef.current = sessionMode;
         }
         await invoke<number>('codex_start_thread', { cwd: projectPath || null, model: null });
-        setPrompt('');
+        if (promptInputRef.current) promptInputRef.current.value = '';
         setTimeline((current) => [
           ...current,
-          { id: crypto.randomUUID(), kind: 'system', title: '用户', body: text },
           { id: crypto.randomUUID(), kind: 'system', title: '正在准备对话', body: '已创建会话，准备完成后会自动发送。' },
         ]);
         return;
       }
       await invoke<number>('codex_start_turn', { threadId, text, cwd: projectPath || null });
-      setPrompt('');
-      setTimeline((current) => [
-        ...current,
-        { id: crypto.randomUUID(), kind: 'system', title: '用户', body: text },
-      ]);
+      if (promptInputRef.current) promptInputRef.current.value = '';
     } catch (error) {
       appendError('发送消息失败', error);
     } finally {
@@ -1704,9 +1711,9 @@ export default function App() {
   }
 
   async function sendPrompt() {
-    const text = prompt.trim();
+    const text = (promptInputRef.current?.value ?? '').trim();
     if (!text) return;
-    setPrompt('');
+    if (promptInputRef.current) promptInputRef.current.value = '';
     if (text.startsWith('/')) {
       await executeSlashCommand(text);
       return;
@@ -2332,6 +2339,45 @@ export default function App() {
     return sessions.filter((s) => (s.title || '').toLowerCase().includes(q) || s.thread_id.toLowerCase().includes(q));
   }, [sessions, searchQuery]);
 
+  const visibleTimeline = useMemo(() => {
+    const limit = 80;
+    if (timeline.length <= limit) return timeline;
+    const hidden = timeline.length - limit;
+    return [
+      {
+        id: 'timeline-truncated',
+        kind: 'system' as const,
+        title: '已折叠历史消息',
+        body: `为提升性能，已隐藏更早的 ${hidden} 条事件（仅渲染最近 ${limit} 条）。`,
+      },
+      ...timeline.slice(-limit),
+    ];
+  }, [timeline]);
+
+  const renderedTimeline = useMemo(
+    () =>
+      visibleTimeline.map((event) =>
+        event.subtype === 'turn' ? (
+          <div key={event.id} className="turn-divider">
+            <span>{event.title}</span>
+            <small>{turnState === 'thinking' ? '思考中…' : turnState === 'runningTools' ? '正在运行工具…' : ''}</small>
+          </div>
+        ) : (
+          <article key={event.id} className={`event ${event.kind}`}>
+            <div className="event-title">{event.title}</div>
+            {event.kind === 'agent' || event.subtype === 'plan' || event.subtype === 'reasoning' ? (
+              <MarkdownBlock value={event.body} />
+            ) : event.kind === 'tool' ? (
+              <pre className="event-mono">{event.body}</pre>
+            ) : (
+              <pre>{event.body}</pre>
+            )}
+          </article>
+        ),
+      ),
+    [visibleTimeline, turnState],
+  );
+
   return (
     <div className="app-shell enterprise-shell">
       <aside className="sidebar enterprise-sidebar">
@@ -2514,25 +2560,7 @@ export default function App() {
         <section className="content-grid enterprise-grid">
           <div className="panel transcript chat-panel">
             <div className="panel-title">对话与执行过程</div>
-            {timeline.map((event) => (
-              event.subtype === 'turn' ? (
-                <div key={event.id} className="turn-divider">
-                  <span>{event.title}</span>
-                  <small>{turnState === 'thinking' ? '思考中…' : turnState === 'runningTools' ? '正在运行工具…' : ''}</small>
-                </div>
-              ) : (
-                <article key={event.id} className={`event ${event.kind}`}>
-                  <div className="event-title">{event.title}</div>
-                  {event.kind === 'agent' || event.subtype === 'plan' || event.subtype === 'reasoning' ? (
-                    <MarkdownBlock value={event.body} />
-                  ) : event.kind === 'tool' ? (
-                    <pre className="event-mono">{event.body}</pre>
-                  ) : (
-                    <pre>{event.body}</pre>
-                  )}
-                </article>
-              )
-            ))}
+            {renderedTimeline}
             {pendingApprovals.length > 0 && (
               <div className="approval-stack">
                 {pendingApprovals.map((approval) => (
@@ -2552,7 +2580,7 @@ export default function App() {
             )}
             <div className="composer enterprise-composer">
               <button className="plus-button" onClick={startThread} disabled={busy || (codexCheck ? !codexCheck.installed : false)}><Plus size={18} /></button>
-              <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={3} placeholder="输入任务，例如：检查 MCP 和 Skill 状态，并继续当前会话。" />
+              <textarea ref={promptInputRef} rows={3} placeholder="输入任务，例如：检查 MCP 和 Skill 状态，并继续当前会话。" />
               <div className="composer-meta">
                 <div className="session-mode-toggle">
                   <button className={sessionMode === 'local' ? 'mode-btn active' : 'mode-btn'} onClick={() => setSessionMode('local')} type="button">
@@ -2566,7 +2594,7 @@ export default function App() {
                   <ShieldCheck size={14} />
                   {status.running ? '企业连接已启用' : '未连接（发送时自动连接）'}
                 </span>
-                <button className="send-button" onClick={sendPrompt} disabled={busy || !prompt.trim() || (codexCheck ? !codexCheck.installed : false)}>
+                <button className="send-button" onClick={sendPrompt} disabled={busy || (codexCheck ? !codexCheck.installed : false)}>
                   {busy ? <Loader2 size={17} /> : <ArrowUp size={17} />}
                 </button>
               </div>
