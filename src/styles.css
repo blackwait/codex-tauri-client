@@ -446,8 +446,16 @@ button:disabled {
 .chat-panel {
   display: flex;
   flex-direction: column;
-  overflow: auto;
+  min-height: 0;
+  overflow: hidden;
   padding: 14px;
+}
+
+.chat-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .panel-title {

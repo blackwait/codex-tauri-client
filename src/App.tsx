@@ -64,6 +64,79 @@ const MarkdownBlock = React.memo(function MarkdownBlock({ value }: { value: stri
   return <pre className="event-mono">{value}</pre>;
 });
 
+type ChatComposerProps = {
+  busy: boolean;
+  codexInstalled: boolean;
+  statusRunning: boolean;
+  sessionMode: SessionMode;
+  onSessionModeChange: (mode: SessionMode) => void;
+  onSend: (text: string) => void | Promise<void>;
+  onNewThread: () => void;
+};
+
+const ChatComposer = React.memo(function ChatComposer({
+  busy,
+  codexInstalled,
+  statusRunning,
+  sessionMode,
+  onSessionModeChange,
+  onSend,
+  onNewThread,
+}: ChatComposerProps) {
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const submit = async () => {
+    const text = (inputRef.current?.value ?? '').trim();
+    if (!text || busy || !codexInstalled) return;
+    if (inputRef.current) inputRef.current.value = '';
+    await onSend(text);
+  };
+
+  return (
+    <div className="composer enterprise-composer">
+      <button className="plus-button" onClick={onNewThread} disabled={busy || !codexInstalled}>
+        <Plus size={18} />
+      </button>
+      <textarea
+        ref={inputRef}
+        rows={3}
+        placeholder="输入任务，例如：检查 MCP 和 Skill 状态，并继续当前会话。"
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            void submit();
+          }
+        }}
+      />
+      <div className="composer-meta">
+        <div className="session-mode-toggle">
+          <button
+            className={sessionMode === 'local' ? 'mode-btn active' : 'mode-btn'}
+            onClick={() => onSessionModeChange('local')}
+            type="button"
+          >
+            Local
+          </button>
+          <button
+            className={sessionMode === 'worktree' ? 'mode-btn active' : 'mode-btn'}
+            onClick={() => onSessionModeChange('worktree')}
+            type="button"
+          >
+            Worktree
+          </button>
+        </div>
+        <span className={statusRunning ? 'permission active' : 'permission'}>
+          <ShieldCheck size={14} />
+          {statusRunning ? '企业连接已启用' : '未连接（发送时自动连接）'}
+        </span>
+        <button className="send-button" onClick={() => void submit()} disabled={busy || !codexInstalled}>
+          {busy ? <Loader2 size={17} /> : <ArrowUp size={17} />}
+        </button>
+      </div>
+    </div>
+  );
+});
+
 type AppServerItem = {
   id?: string;
   type?: string;
@@ -687,8 +760,8 @@ export default function App() {
   const [quickSandbox, setQuickSandbox] = useState('');
   const [sessionMode, setSessionMode] = useState<SessionMode>('local');
   const pendingPromptRef = useRef<string | null>(null);
-  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const bootstrappedRef = useRef(false);
+  const timelineScrollRef = useRef<HTMLDivElement | null>(null);
   const pendingCreateSessionProjectIdRef = useRef<number | null>(null);
   const pendingSessionModeRef = useRef<SessionMode>('local');
   const threadIdRef = useRef<string | null>(null);
@@ -704,6 +777,7 @@ export default function App() {
   const serviceLogFlushTimerRef = useRef<number | null>(null);
   const serviceLogPendingRef = useRef<string>('');
   const [turnIndex, setTurnIndex] = useState<number>(0);
+  const turnIndexRef = useRef<number>(0);
   const [turnState, setTurnState] = useState<'idle' | 'thinking' | 'runningTools'>('idle');
   const [editingProjectId, setEditingProjectId] = useState<number | null>(null);
   const [editingProjectName, setEditingProjectName] = useState('');
@@ -729,11 +803,21 @@ export default function App() {
   }, [execProcessId]);
 
   useEffect(() => {
+    turnIndexRef.current = turnIndex;
+  }, [turnIndex]);
+
+  useEffect(() => {
     if (!threadGitInfo) return;
     setMetadataSha(threadGitInfo.sha ?? '');
     setMetadataBranch(threadGitInfo.branch ?? '');
     setMetadataOrigin(threadGitInfo.originUrl ?? '');
   }, [threadGitInfo]);
+
+  useEffect(() => {
+    const node = timelineScrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [timeline]);
 
   useEffect(() => {
     const unsubs: Array<() => void> = [];
@@ -811,7 +895,7 @@ export default function App() {
             }
             const id = crypto.randomUUID();
             streamingAgentRef.current = { itemId: params.itemId ?? id, timelineId: id };
-            return [...current, { id, kind: 'agent', title: '助手', body: delta, turnIndex }];
+            return [...current, { id, kind: 'agent', title: '助手', body: delta, turnIndex: turnIndexRef.current }];
           });
         }
         return;
@@ -880,7 +964,7 @@ export default function App() {
                   subtype: 'commandExecution',
                   title: `命令：${typeof item.command === 'string' ? item.command : 'command'}`,
                   body: '',
-                  turnIndex,
+                  turnIndex: turnIndexRef.current,
                 },
               ]);
               return;
@@ -932,7 +1016,7 @@ export default function App() {
               const args = item.arguments ? `arguments:\n${toPretty(item.arguments)}\n` : '';
               setTimeline((current) => [
                 ...current,
-                { id: timelineId, kind: 'tool', subtype: 'mcpToolCall', title: `MCP：${server}/${tool}`, body: args, turnIndex },
+                { id: timelineId, kind: 'tool', subtype: 'mcpToolCall', title: `MCP：${server}/${tool}`, body: args, turnIndex: turnIndexRef.current },
               ]);
               return;
             }
@@ -963,7 +1047,7 @@ export default function App() {
               const args = item.arguments ? `arguments:\n${toPretty(item.arguments)}\n` : '';
               setTimeline((current) => [
                 ...current,
-                { id: timelineId, kind: 'tool', subtype: 'dynamicToolCall', title: `动态工具：${tool}`, body: args, turnIndex },
+                { id: timelineId, kind: 'tool', subtype: 'dynamicToolCall', title: `动态工具：${tool}`, body: args, turnIndex: turnIndexRef.current },
               ]);
               return;
             }
@@ -1057,10 +1141,6 @@ export default function App() {
         streamingToolRef.current.clear();
         latestDiffTimelineIdRef.current = null;
         setTurnState('idle');
-        const tid = threadIdRef.current;
-        if (tid) {
-          invoke<number>('codex_read_thread', { threadId: tid, includeTurns: true }).catch(() => {});
-        }
       }
 
       const notifyThreadId = extractThreadIdFromNotification(method, envelope.params);
@@ -1249,7 +1329,12 @@ export default function App() {
 
     if (!bootstrappedRef.current) {
       bootstrappedRef.current = true;
-      connectCodex(false).catch((error) => appendError('企业研发助手连接失败', error));
+      connectCodex(false)
+        .then((connected) => {
+          if (connected) return refreshEnterpriseCapabilities();
+          return undefined;
+        })
+        .catch((error) => appendError('企业研发助手连接失败', error));
     }
 
     return () => {
@@ -1259,7 +1344,7 @@ export default function App() {
       }
       unsubs.forEach((unlisten) => unlisten());
     };
-  }, [projectPath]);
+  }, []);
 
   const activeConversation = useMemo(() => {
     if (!threadId) return conversations[0];
@@ -1308,7 +1393,6 @@ export default function App() {
         { id: crypto.randomUUID(), kind: 'system', title: '连接就绪', body: '可以直接输入任务并发送。' },
       ]);
     }
-    await refreshEnterpriseCapabilities();
     return nextStatus;
   }
 
@@ -1340,10 +1424,12 @@ export default function App() {
   async function refreshEnterpriseCapabilities() {
     if (!isTauriRuntime) return;
     if (!(await connectCodex(false))) return;
+    const cwd = projectPathRef.current || null;
+    const activeThreadId = threadIdRef.current;
     await Promise.allSettled([
-      invoke<number>('codex_list_threads', { cwd: projectPath || null, searchTerm: null }),
-      invoke<number>('codex_list_skills', { cwd: projectPath || null, forceReload: false }),
-      invoke<number>('codex_list_mcp_servers', { threadId }),
+      invoke<number>('codex_list_threads', { cwd, searchTerm: null }),
+      invoke<number>('codex_list_skills', { cwd, forceReload: false }),
+      invoke<number>('codex_list_mcp_servers', { threadId: activeThreadId }),
     ]);
   }
 
@@ -1399,7 +1485,6 @@ export default function App() {
           pendingSessionModeRef.current = sessionMode;
         }
         await invoke<number>('codex_start_thread', { cwd: projectPath || null, model: null });
-        if (promptInputRef.current) promptInputRef.current.value = '';
         setTimeline((current) => [
           ...current,
           { id: crypto.randomUUID(), kind: 'system', title: '正在准备对话', body: '已创建会话，准备完成后会自动发送。' },
@@ -1407,7 +1492,6 @@ export default function App() {
         return;
       }
       await invoke<number>('codex_start_turn', { threadId, text, cwd: projectPath || null });
-      if (promptInputRef.current) promptInputRef.current.value = '';
     } catch (error) {
       appendError('发送消息失败', error);
     } finally {
@@ -1710,10 +1794,8 @@ export default function App() {
     }
   }
 
-  async function sendPrompt() {
-    const text = (promptInputRef.current?.value ?? '').trim();
+  async function sendPrompt(text: string) {
     if (!text) return;
-    if (promptInputRef.current) promptInputRef.current.value = '';
     if (text.startsWith('/')) {
       await executeSlashCommand(text);
       return;
@@ -2560,45 +2642,35 @@ export default function App() {
         <section className="content-grid enterprise-grid">
           <div className="panel transcript chat-panel">
             <div className="panel-title">对话与执行过程</div>
-            {renderedTimeline}
-            {pendingApprovals.length > 0 && (
-              <div className="approval-stack">
-                {pendingApprovals.map((approval) => (
-                  <div key={approval.id} className="approval-card">
-                    <div>
-                      <strong>需要人工确认</strong>
-                      <small>{approval.method}</small>
+            <div className="chat-scroll" ref={timelineScrollRef}>
+              {renderedTimeline}
+              {pendingApprovals.length > 0 && (
+                <div className="approval-stack">
+                  {pendingApprovals.map((approval) => (
+                    <div key={approval.id} className="approval-card">
+                      <div>
+                        <strong>需要人工确认</strong>
+                        <small>{approval.method}</small>
+                      </div>
+                      <pre>{toPretty(approval.params)}</pre>
+                      <div className="approval-actions">
+                        <button onClick={() => answerApproval(approval, false)}>拒绝</button>
+                        <button onClick={() => answerApproval(approval, true)}>同意一次</button>
+                      </div>
                     </div>
-                    <pre>{toPretty(approval.params)}</pre>
-                    <div className="approval-actions">
-                      <button onClick={() => answerApproval(approval, false)}>拒绝</button>
-                      <button onClick={() => answerApproval(approval, true)}>同意一次</button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="composer enterprise-composer">
-              <button className="plus-button" onClick={startThread} disabled={busy || (codexCheck ? !codexCheck.installed : false)}><Plus size={18} /></button>
-              <textarea ref={promptInputRef} rows={3} placeholder="输入任务，例如：检查 MCP 和 Skill 状态，并继续当前会话。" />
-              <div className="composer-meta">
-                <div className="session-mode-toggle">
-                  <button className={sessionMode === 'local' ? 'mode-btn active' : 'mode-btn'} onClick={() => setSessionMode('local')} type="button">
-                    Local
-                  </button>
-                  <button className={sessionMode === 'worktree' ? 'mode-btn active' : 'mode-btn'} onClick={() => setSessionMode('worktree')} type="button">
-                    Worktree
-                  </button>
+                  ))}
                 </div>
-                <span className={status.running ? 'permission active' : 'permission'}>
-                  <ShieldCheck size={14} />
-                  {status.running ? '企业连接已启用' : '未连接（发送时自动连接）'}
-                </span>
-                <button className="send-button" onClick={sendPrompt} disabled={busy || (codexCheck ? !codexCheck.installed : false)}>
-                  {busy ? <Loader2 size={17} /> : <ArrowUp size={17} />}
-                </button>
-              </div>
+              )}
             </div>
+            <ChatComposer
+              busy={busy}
+              codexInstalled={codexCheck ? codexCheck.installed : false}
+              statusRunning={status.running}
+              sessionMode={sessionMode}
+              onSessionModeChange={setSessionMode}
+              onSend={sendPrompt}
+              onNewThread={startThread}
+            />
           </div>
 
           <aside className="panel detail guard-panel">
