@@ -77,6 +77,11 @@ fn codex_resume_thread(state: State<'_, SharedCodexBridge>, thread_id: String) -
 }
 
 #[tauri::command]
+fn codex_resume_thread_sync(state: State<'_, SharedCodexBridge>, thread_id: String) -> Result<String, String> {
+  state.0.resume_thread_sync(thread_id, 30)
+}
+
+#[tauri::command]
 fn codex_read_thread(state: State<'_, SharedCodexBridge>, thread_id: String, include_turns: bool) -> Result<u64, String> {
   state.0.read_thread(thread_id, include_turns)
 }
@@ -109,6 +114,33 @@ fn codex_start_turn(
     approval_policy,
     approvals_reviewer,
     sandbox_policy,
+  )
+}
+
+#[tauri::command]
+fn codex_start_turn_sync(
+  state: State<'_, SharedCodexBridge>,
+  thread_id: String,
+  text: Option<String>,
+  input: Option<serde_json::Value>,
+  cwd: Option<String>,
+  model: Option<String>,
+  effort: Option<String>,
+  approval_policy: Option<serde_json::Value>,
+  approvals_reviewer: Option<String>,
+  sandbox_policy: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+  state.0.start_turn_sync(
+    thread_id,
+    text,
+    input,
+    cwd,
+    model,
+    effort,
+    approval_policy,
+    approvals_reviewer,
+    sandbox_policy,
+    60,
   )
 }
 
@@ -552,9 +584,11 @@ pub fn run() {
       codex_start_thread_sync,
       codex_list_threads,
       codex_resume_thread,
+      codex_resume_thread_sync,
       codex_read_thread,
       codex_read_thread_sync,
       codex_start_turn,
+      codex_start_turn_sync,
       codex_update_thread_settings,
       codex_list_models_sync,
       codex_steer_turn,

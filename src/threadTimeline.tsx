@@ -1,11 +1,24 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { ChevronDown, SquareTerminal } from 'lucide-react';
+import { convertFileSrc } from '@tauri-apps/api/core';
+import ReactMarkdown from 'react-markdown';
+import rehypeHighlight from 'rehype-highlight';
+import remarkGfm from 'remark-gfm';
+import { ChevronDown, Circle, FileText, Globe2, PencilLine, Search, Sparkles, SquareTerminal, Wrench } from 'lucide-react';
+
+export type TimelineAttachment = {
+  id: string;
+  kind: 'image' | 'file';
+  previewUrl?: string;
+  path?: string;
+  name: string;
+};
 
 export type TimelineItem = {
   id: string;
   kind: 'agent' | 'user' | 'tool' | 'system' | 'error' | 'approval';
   title: string;
   body: string;
+  attachments?: TimelineAttachment[];
   subtype?: string;
   turnIndex?: number;
   completed?: boolean;
@@ -23,7 +36,7 @@ export type TimelineDisplayBlock =
       type: 'assistant-turn';
       turnIndex: number;
       tools: TimelineItem[];
-      agent: TimelineItem | null;
+      agents: TimelineItem[];
       timing?: TurnTiming;
     };
 
@@ -77,12 +90,6 @@ function truncateCommand(cmd: string, max = 76): string {
   return `${oneLine.slice(0, max)}...`;
 }
 
-function commandFromItem(item: TimelineItem): string {
-  if (item.command) return item.command;
-  if (item.title.startsWith('命令：')) return item.title.slice('命令：'.length).trim();
-  return item.title;
-}
-
 function formatDurationMs(ms: number): string {
   if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`;
   const seconds = Math.round(ms / 1000);
@@ -90,6 +97,46 @@ function formatDurationMs(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return rest > 0 ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
+function userInputSummary(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((item: any) => {
+      if (item?.type === 'text' && typeof item.text === 'string') return item.text;
+      if (item?.type === 'input_text' && typeof item.text === 'string') return item.text;
+      if (item?.type === 'mention' && typeof item.name === 'string') return `@${item.name}`;
+      if (item?.type === 'skill' && typeof item.name === 'string') return `$${item.name}`;
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function userInputAttachments(content: unknown): TimelineAttachment[] {
+  if (!Array.isArray(content)) return [];
+  return content
+    .map((item: any) => {
+      if (item?.type === 'image' && typeof item.url === 'string') {
+        return {
+          id: crypto.randomUUID(),
+          kind: 'image' as const,
+          previewUrl: item.url,
+          name: 'image',
+        };
+      }
+      if (item?.type === 'localImage' && typeof item.path === 'string') {
+        return {
+          id: crypto.randomUUID(),
+          kind: 'image' as const,
+          previewUrl: convertFileSrc(item.path),
+          path: item.path,
+          name: item.path.split(/[/\\]/).pop() ?? 'image',
+        };
+      }
+      return null;
+    })
+    .filter(Boolean) as TimelineAttachment[];
 }
 
 export function itemDurationMs(item: TimelineItem, now = Date.now()): number | null {
@@ -133,11 +180,185 @@ const META_TOOL_SUBTYPES = new Set([
   'commandExecution',
   'mcpToolCall',
   'dynamicToolCall',
+  'read',
+  'search',
   'plan',
   'webSearch',
   'fileChange',
   'todoList',
 ]);
+
+type ProcessKind = 'read' | 'search' | 'webSearch' | 'command' | 'mcp' | 'reasoning' | 'plan' | 'fileChange' | 'tool';
+
+function processKind(tool: TimelineItem): ProcessKind {
+  switch (tool.subtype) {
+    case 'read':
+      return 'read';
+    case 'search':
+      return 'search';
+    case 'webSearch':
+      return 'webSearch';
+    case 'commandExecution':
+      return 'command';
+    case 'mcpToolCall':
+      return 'mcp';
+    case 'reasoning':
+      return 'reasoning';
+    case 'plan':
+    case 'todoList':
+      return 'plan';
+    case 'fileChange':
+      return 'fileChange';
+    default:
+      return 'tool';
+  }
+}
+
+function processKindLabel(kind: ProcessKind) {
+  switch (kind) {
+    case 'read':
+      return '读取文件';
+    case 'search':
+      return '搜索代码';
+    case 'webSearch':
+      return '搜索网页';
+    case 'command':
+      return '运行命令';
+    case 'mcp':
+      return '调用 MCP';
+    case 'reasoning':
+      return '思考';
+    case 'plan':
+      return '更新计划';
+    case 'fileChange':
+      return '修改文件';
+    default:
+      return '使用工具';
+  }
+}
+
+function processRowTitle(kind: ProcessKind, running: boolean) {
+  if (kind === 'read' || kind === 'search') return processVerb(kind, !running);
+  if (running) return processKindLabel(kind).replace(/^运行/, '正在运行').replace(/^调用/, '正在调用');
+  return processVerb(kind, true);
+}
+
+function processVerb(kind: ProcessKind, completed: boolean) {
+  if (!completed) {
+    switch (kind) {
+      case 'read':
+        return '正在读取';
+      case 'search':
+        return '正在搜索';
+      case 'webSearch':
+        return '正在搜索网页';
+      case 'command':
+        return '正在运行';
+      case 'mcp':
+        return '正在调用';
+      case 'reasoning':
+        return '正在思考';
+      case 'plan':
+        return '正在更新计划';
+      case 'fileChange':
+        return '正在修改';
+      default:
+        return '正在处理';
+    }
+  }
+  switch (kind) {
+    case 'read':
+      return '已读取';
+    case 'search':
+      return '已搜索代码';
+    case 'webSearch':
+      return '已搜索网页';
+    case 'command':
+      return '已运行';
+    case 'mcp':
+      return '已调用 MCP';
+    case 'reasoning':
+      return '已思考';
+    case 'plan':
+      return '已更新计划';
+    case 'fileChange':
+      return '已修改';
+    default:
+      return '已处理';
+  }
+}
+
+function ProcessIcon({ kind, running }: { kind: ProcessKind; running: boolean }) {
+  const size = 14;
+  const className = running ? 'process-row-icon running' : 'process-row-icon';
+  switch (kind) {
+    case 'read':
+      return <FileText size={size} className={className} />;
+    case 'search':
+      return <Search size={size} className={className} />;
+    case 'webSearch':
+      return <Globe2 size={size} className={className} />;
+    case 'command':
+      return <SquareTerminal size={size} className={className} />;
+    case 'mcp':
+    case 'tool':
+      return <Wrench size={size} className={className} />;
+    case 'reasoning':
+      return <Sparkles size={size} className={className} />;
+    case 'plan':
+      return <Circle size={size} className={className} />;
+    case 'fileChange':
+      return <PencilLine size={size} className={className} />;
+  }
+}
+
+function toolDetail(tool: TimelineItem) {
+  const body = tool.body?.trim() ?? '';
+  if (tool.command) return truncateCommand(tool.command, 90);
+  const firstLine = body.split('\n').find(Boolean);
+  return firstLine ? truncateCommand(firstLine, 90) : tool.title;
+}
+
+function processSummary(tools: TimelineItem[], active: boolean, now: number) {
+  const visible = tools.filter((tool) => META_TOOL_SUBTYPES.has(tool.subtype ?? ''));
+  const running = visible.find((tool) => tool.completed === false);
+  if (running) {
+    const kind = processKind(running);
+    const duration = itemDurationLabel(running, now);
+    const detail = toolDetail(running);
+    return `${processVerb(kind, false)}${duration ? ` ${duration}` : ''}${detail ? ` ${detail}` : ''}`;
+  }
+
+  const counts = new Map<ProcessKind, number>();
+  for (const tool of visible) {
+    const kind = processKind(tool);
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  if (counts.size === 0) return active ? '正在思考' : '已处理';
+
+  const parts: string[] = [];
+  const readCount = counts.get('read') ?? 0;
+  const searchCount = counts.get('search') ?? 0;
+  const webCount = counts.get('webSearch') ?? 0;
+  const commandCount = counts.get('command') ?? 0;
+  const mcpCount = counts.get('mcp') ?? 0;
+  const changeCount = counts.get('fileChange') ?? 0;
+  const planCount = counts.get('plan') ?? 0;
+  const reasoningCount = counts.get('reasoning') ?? 0;
+  const otherCount = counts.get('tool') ?? 0;
+
+  if (readCount) parts.push(`已读取 ${readCount} 个文件`);
+  if (searchCount) parts.push('已搜索代码');
+  if (webCount) parts.push('已搜索网页');
+  if (commandCount) parts.push(`已运行 ${commandCount} 条命令`);
+  if (mcpCount) parts.push(`已调用 ${mcpCount} 个 MCP 工具`);
+  if (changeCount) parts.push('已修改文件');
+  if (planCount) parts.push('已更新计划');
+  if (reasoningCount && parts.length === 0) parts.push('已思考');
+  if (otherCount) parts.push(`已使用 ${otherCount} 个工具`);
+
+  return parts.join('并') || '已处理';
+}
 
 export function isThreadRenderable(event: TimelineItem) {
   return event.kind === 'user' || event.kind === 'agent' || event.kind === 'tool';
@@ -148,13 +369,13 @@ export function groupTimelineItems(
   turnTiming: Record<number, TurnTiming>,
 ): TimelineDisplayBlock[] {
   const blocks: TimelineDisplayBlock[] = [];
-  const buckets = new Map<number, { tools: TimelineItem[]; agent: TimelineItem | null }>();
+  const buckets = new Map<number, { tools: TimelineItem[]; agents: TimelineItem[] }>();
 
   const flushTurn = (turnIndex: number) => {
     const bucket = buckets.get(turnIndex);
     if (!bucket) return;
     const visibleTools = bucket.tools.filter((tool) => !HIDDEN_TOOL_SUBTYPES.has(tool.subtype ?? ''));
-    if (visibleTools.length === 0 && !bucket.agent) {
+    if (visibleTools.length === 0 && bucket.agents.length === 0) {
       buckets.delete(turnIndex);
       return;
     }
@@ -162,7 +383,7 @@ export function groupTimelineItems(
       type: 'assistant-turn',
       turnIndex,
       tools: visibleTools,
-      agent: bucket.agent,
+      agents: bucket.agents,
       timing: turnTiming[turnIndex],
     });
     buckets.delete(turnIndex);
@@ -176,11 +397,11 @@ export function groupTimelineItems(
     }
 
     const turnIndex = item.turnIndex ?? 0;
-    if (!buckets.has(turnIndex)) buckets.set(turnIndex, { tools: [], agent: null });
+    if (!buckets.has(turnIndex)) buckets.set(turnIndex, { tools: [], agents: [] });
     const bucket = buckets.get(turnIndex)!;
 
     if (item.kind === 'agent') {
-      bucket.agent = item;
+      bucket.agents.push(item);
     } else if (item.kind === 'tool' && !HIDDEN_TOOL_SUBTYPES.has(item.subtype ?? '')) {
       bucket.tools.push(item);
     }
@@ -195,16 +416,14 @@ export function timelineItemFromThreadItem(item: any, turnIndex: number): Timeli
   if (!type) return null;
 
   if (type === 'userMessage') {
-    const content = Array.isArray(item?.content) ? item.content : [];
-    const text = content
-      .filter((c: any) => c?.type === 'text' && typeof c?.text === 'string')
-      .map((c: any) => c.text)
-      .join('\n');
+    const text = userInputSummary(item?.content);
+    const attachments = userInputAttachments(item?.content);
     return {
       id: typeof item.id === 'string' ? item.id : crypto.randomUUID(),
       kind: 'user',
       title: '用户',
       body: text || toPretty(item),
+      attachments,
       turnIndex,
       completed: true,
     };
@@ -243,6 +462,18 @@ export function timelineItemFromThreadItem(item: any, turnIndex: number): Timeli
       subtype: 'plan',
       title: '计划',
       body: typeof item.text === 'string' ? item.text : toPretty(item),
+      turnIndex,
+      completed: true,
+    };
+  }
+
+  if (type === 'hookPrompt') {
+    return {
+      id: typeof item.id === 'string' ? item.id : crypto.randomUUID(),
+      kind: 'tool',
+      subtype: 'plan',
+      title: 'Hook 提示',
+      body: toPretty(item.fragments ?? item),
       turnIndex,
       completed: true,
     };
@@ -327,6 +558,77 @@ export function timelineItemFromThreadItem(item: any, turnIndex: number): Timeli
     };
   }
 
+  if (type === 'imageView') {
+    return {
+      id: typeof item.id === 'string' ? item.id : crypto.randomUUID(),
+      kind: 'tool',
+      subtype: 'read',
+      title: '查看图片',
+      body: typeof item.path === 'string' ? item.path : toPretty(item),
+      turnIndex,
+      completed: true,
+    };
+  }
+
+  if (type === 'imageGeneration') {
+    const lines = [
+      typeof item.revisedPrompt === 'string' && item.revisedPrompt ? `prompt: ${item.revisedPrompt}` : '',
+      typeof item.savedPath === 'string' && item.savedPath ? `saved: ${item.savedPath}` : '',
+      typeof item.result === 'string' && item.result ? item.result : '',
+    ].filter(Boolean);
+    return {
+      id: typeof item.id === 'string' ? item.id : crypto.randomUUID(),
+      kind: 'tool',
+      subtype: 'dynamicToolCall',
+      title: '图片生成',
+      body: lines.join('\n') || toPretty(item),
+      turnIndex,
+      completed: true,
+    };
+  }
+
+  if (type === 'collabAgentToolCall') {
+    const lines = [
+      typeof item.tool === 'string' ? `tool: ${item.tool}` : '',
+      typeof item.prompt === 'string' && item.prompt ? `prompt: ${item.prompt}` : '',
+      item.receiverThreadIds ? `receivers: ${toPretty(item.receiverThreadIds)}` : '',
+      item.agentsStates ? `states: ${toPretty(item.agentsStates)}` : '',
+    ].filter(Boolean);
+    return {
+      id: typeof item.id === 'string' ? item.id : crypto.randomUUID(),
+      kind: 'tool',
+      subtype: 'dynamicToolCall',
+      title: '协作代理',
+      body: lines.join('\n') || toPretty(item),
+      turnIndex,
+      completed: true,
+    };
+  }
+
+  if (type === 'enteredReviewMode' || type === 'exitedReviewMode') {
+    return {
+      id: typeof item.id === 'string' ? item.id : crypto.randomUUID(),
+      kind: 'tool',
+      subtype: 'plan',
+      title: type === 'enteredReviewMode' ? '进入 Review 模式' : '退出 Review 模式',
+      body: typeof item.review === 'string' ? item.review : toPretty(item),
+      turnIndex,
+      completed: true,
+    };
+  }
+
+  if (type === 'contextCompaction') {
+    return {
+      id: typeof item.id === 'string' ? item.id : crypto.randomUUID(),
+      kind: 'tool',
+      subtype: 'plan',
+      title: '上下文压缩',
+      body: '当前会话发生了上下文压缩。',
+      turnIndex,
+      completed: true,
+    };
+  }
+
   return null;
 }
 
@@ -348,57 +650,84 @@ export function timelineFromThreadRead(result: unknown): TimelineItem[] {
   return items;
 }
 
+function sanitizeMarkdown(value: string) {
+  return value.replace(/<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>/g, '').trim();
+}
+
 const MarkdownBlock = React.memo(function MarkdownBlock({ value }: { value: string }) {
-  return <pre className="event-mono">{value}</pre>;
+  const sanitized = sanitizeMarkdown(value);
+  if (!sanitized) return null;
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeHighlight]}
+        components={{
+          a: ({ ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
+        }}
+      >
+        {sanitized}
+      </ReactMarkdown>
+    </div>
+  );
 });
 
 const UserMessageRow = React.memo(function UserMessageRow({ event }: { event: TimelineItem }) {
+  const [preview, setPreview] = useState<TimelineAttachment | null>(null);
+  const imageAttachments = (event.attachments ?? []).filter((item) => item.kind === 'image' && item.previewUrl);
   return (
     <article className="chat-message chat-user">
       <div className="chat-user-bubble">
-        <pre>{event.body}</pre>
+        {imageAttachments.length > 0 ? (
+          <div className="chat-user-images">
+            {imageAttachments.map((image) => (
+              <button
+                key={image.id}
+                className="chat-user-image"
+                type="button"
+                title="双击放大图片"
+                onDoubleClick={() => setPreview(image)}
+              >
+                <img src={image.previewUrl} alt={image.name} />
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {event.body ? <pre>{event.body}</pre> : null}
       </div>
+      {preview?.previewUrl ? (
+        <div className="image-preview-overlay" onClick={() => setPreview(null)}>
+          <button className="image-preview-close" type="button" onClick={() => setPreview(null)}>
+            关闭
+          </button>
+          <img
+            className="image-preview-full"
+            src={preview.previewUrl}
+            alt={preview.name}
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>
+      ) : null}
     </article>
   );
 });
 
 const AssistantTurnRow = React.memo(function AssistantTurnRow({
   tools,
-  agent,
+  agents,
   timing,
   active,
 }: {
   tools: TimelineItem[];
-  agent: TimelineItem | null;
+  agents: TimelineItem[];
   timing?: TurnTiming;
   active?: boolean;
 }) {
   const [metaOpen, setMetaOpen] = useState(false);
-  const [commandsOpen, setCommandsOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
   const metaTools = tools.filter((tool) => META_TOOL_SUBTYPES.has(tool.subtype ?? ''));
-  const reasoningItems = metaTools.filter((tool) => tool.subtype === 'reasoning');
-  const reasoningText = reasoningItems
-    .map((tool) => tool.body.trim())
-    .filter(Boolean)
-    .join('\n\n');
-  const planText = metaTools
-    .filter((tool) => tool.subtype === 'plan')
-    .map((tool) => tool.body.trim())
-    .filter(Boolean)
-    .join('\n\n');
-  const commandItems = metaTools.filter((tool) =>
-    ['commandExecution', 'mcpToolCall', 'dynamicToolCall'].includes(tool.subtype ?? ''),
-  );
-  const otherMeta = metaTools.filter(
-    (tool) =>
-      !['reasoning', 'plan', 'commandExecution', 'mcpToolCall', 'dynamicToolCall'].includes(tool.subtype ?? ''),
-  );
-
   const hasMeta = metaTools.length > 0 || active;
-  const commandsRunning = commandItems.some((tool) => tool.completed === false);
-  const showCommandsBody = commandsOpen || (active && commandsRunning);
   const toolsRunning = metaTools.some((tool) => tool.completed === false);
   const showMetaBody = metaOpen || (active && toolsRunning);
 
@@ -407,9 +736,6 @@ const AssistantTurnRow = React.memo(function AssistantTurnRow({
     const timer = window.setInterval(() => setNow(Date.now()), 500);
     return () => window.clearInterval(timer);
   }, [active, toolsRunning]);
-
-  const totalCommandMs = commandItems.reduce((sum, tool) => sum + (itemDurationMs(tool, now) ?? 0), 0);
-  const firstRunningDuration = commandItems[0] ? itemDurationLabel(commandItems[0], now) : null;
 
   const durationMs =
     timing?.completedAt && timing?.startedAt
@@ -424,70 +750,63 @@ const AssistantTurnRow = React.memo(function AssistantTurnRow({
       : toolsRunning || active
         ? '处理中…'
         : '已处理';
+  const summaryLabel = processSummary(metaTools, Boolean(active), now);
 
-  if (!hasMeta && !agent) return null;
+  if (!hasMeta && agents.length === 0) return null;
 
   return (
     <article className="chat-message chat-agent">
       <div className="chat-agent-turn">
         {hasMeta ? (
-          <div className="turn-meta">
+          <div className={toolsRunning ? 'turn-meta running' : 'turn-meta'}>
             <button type="button" className="turn-meta-toggle" onClick={() => setMetaOpen((value) => !value)}>
-              <span>{processedLabel}</span>
-              <ChevronDown size={14} className={metaOpen ? 'turn-chevron open' : 'turn-chevron'} />
+              <span className="turn-meta-status">{processedLabel}</span>
+              <span className="turn-meta-summary">{summaryLabel}</span>
+              <ChevronDown size={14} className={showMetaBody ? 'turn-chevron open' : 'turn-chevron'} />
             </button>
             {showMetaBody ? (
               <div className="turn-meta-body">
-                {reasoningText ? (
-                  <p className="turn-reasoning-text">
-                    {reasoningItems.some((tool) => itemDurationLabel(tool, now)) ? (
-                      <span className="turn-inline-duration">
-                        思考 · {itemDurationLabel(reasoningItems[0], now)}
-                        {' · '}
-                      </span>
-                    ) : null}
-                    {reasoningText}
-                  </p>
-                ) : null}
-                {planText ? <p className="turn-plan-text">{planText}</p> : null}
-                {commandItems.length > 0 ? (
-                  <div className="turn-commands">
-                    <button type="button" className="turn-commands-toggle" onClick={() => setCommandsOpen((value) => !value)}>
-                      <SquareTerminal size={14} />
-                      <span>
-                        {commandsRunning
-                          ? `正在运行${firstRunningDuration ? ` · ${firstRunningDuration}` : ''} ${truncateCommand(commandFromItem(commandItems[0]), 40)}`
-                          : `已运行 ${commandItems.length} 条命令${totalCommandMs > 0 ? ` · ${formatDurationMs(totalCommandMs)}` : ''}`}
-                      </span>
-                      <ChevronDown size={14} className={commandsOpen ? 'turn-chevron open' : 'turn-chevron'} />
-                    </button>
-                    {showCommandsBody ? (
-                      <ul className="turn-command-list">
-                        {commandItems.map((tool) => {
-                          const duration = itemDurationLabel(tool, now);
-                          return (
-                          <li key={tool.id}>
-                            <div className="turn-command-head">
-                              <span className="turn-command-label">{tool.completed === false ? '正在运行' : '已运行'}</span>
-                              {duration ? <span className="turn-command-duration">{duration}</span> : null}
-                            </div>
-                            <code>{truncateCommand(commandFromItem(tool))}</code>
-                            {tool.body?.trim() ? <pre className="turn-command-output">{tool.body.trim()}</pre> : null}
-                          </li>
-                          );
-                        })}
-                      </ul>
-                    ) : null}
-                  </div>
-                ) : null}
-                {otherMeta.map((tool) => {
+                <ul className="process-list">
+                  {metaTools.map((tool) => {
+                    const kind = processKind(tool);
+                    const running = tool.completed === false;
+                    const shimmer = running && (kind === 'command' || kind === 'reasoning');
+                    const duration = itemDurationLabel(tool, now);
+                    const body = tool.body?.trim();
+                    return (
+                      <li key={tool.id} className={running ? 'process-row running' : 'process-row'}>
+                        <ProcessIcon kind={kind} running={running} />
+                        <div className="process-row-main">
+                          <div className="process-row-head">
+                            <span className={shimmer ? 'process-row-title running-shimmer-text' : 'process-row-title'}>
+                              {processRowTitle(kind, running)}
+                            </span>
+                            {duration ? (
+                              <span className={shimmer ? 'process-row-duration running-shimmer-text' : 'process-row-duration'}>
+                                {duration}
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className={shimmer ? 'process-row-detail running-shimmer-text' : 'process-row-detail'}>{toolDetail(tool)}</div>
+                          {body && !['reasoning', 'plan', 'todoList'].includes(tool.subtype ?? '') ? (
+                            <pre className={shimmer ? 'process-row-output running-shimmer-text' : 'process-row-output'}>{body}</pre>
+                          ) : null}
+                          {body && ['reasoning', 'plan', 'todoList'].includes(tool.subtype ?? '') ? (
+                            <p className={shimmer ? 'process-row-text running-shimmer-text' : 'process-row-text'}>{body}</p>
+                          ) : null}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+                {tools.filter((tool) => !META_TOOL_SUBTYPES.has(tool.subtype ?? '')).map((tool) => {
                   const duration = itemDurationLabel(tool, now);
                   return (
-                  <p key={tool.id} className="turn-other-meta">
-                    {tool.title}
-                    {duration ? ` · ${duration}` : ''}
-                    {tool.body?.trim() ? ` · ${tool.body.trim().split('\n')[0]}` : ''}
-                  </p>
+                    <p key={tool.id} className="turn-other-meta">
+                      {tool.title}
+                      {duration ? ` · ${duration}` : ''}
+                      {tool.body?.trim() ? ` · ${tool.body.trim().split('\n')[0]}` : ''}
+                    </p>
                   );
                 })}
               </div>
@@ -495,9 +814,13 @@ const AssistantTurnRow = React.memo(function AssistantTurnRow({
           </div>
         ) : null}
 
-        {agent ? (
-          <div className={`chat-agent-body ${agent.completed === false ? 'chat-streaming' : ''}`}>
-            <MarkdownBlock value={agent.body} />
+        {agents.length > 0 ? (
+          <div className="chat-agent-messages">
+            {agents.map((agent) => (
+              <div key={agent.id} className={`chat-agent-body ${agent.completed === false ? 'chat-streaming' : ''}`}>
+                <MarkdownBlock value={agent.body} />
+              </div>
+            ))}
           </div>
         ) : active && toolsRunning ? (
           <ThinkingShimmer />
@@ -529,12 +852,12 @@ export const ThreadTimelineView = React.memo(function ThreadTimelineView({
         const active =
           waitingForReply &&
           block.turnIndex === activeTurnIndex &&
-          (block.agent?.completed === false || !block.agent);
+          ((block.agents[block.agents.length - 1]?.completed === false) || block.agents.length === 0);
         return (
           <AssistantTurnRow
-            key={`turn-${block.turnIndex}-${block.agent?.id ?? 'pending'}`}
+            key={`turn-${block.turnIndex}-${block.agents[block.agents.length - 1]?.id ?? 'pending'}`}
             tools={block.tools}
-            agent={block.agent}
+            agents={block.agents}
             timing={block.timing}
             active={active}
           />
@@ -547,7 +870,7 @@ export const ThreadTimelineView = React.memo(function ThreadTimelineView({
 /** @deprecated Use ThreadTimelineView — kept for compatibility */
 export const ThreadTimelineRow = React.memo(function ThreadTimelineRow({ event }: { event: TimelineItem }) {
   if (event.kind === 'user') return <UserMessageRow event={event} />;
-  if (event.kind === 'agent') return <AssistantTurnRow tools={[]} agent={event} />;
+  if (event.kind === 'agent') return <AssistantTurnRow tools={[]} agents={[event]} />;
   return null;
 });
 
@@ -555,7 +878,7 @@ export function ThinkingShimmer() {
   return (
     <div className="thinking-shimmer" aria-label="思考中">
       <span className="thinking-shimmer-dot" />
-      <span>Thinking</span>
+      <span className="running-shimmer-text">Thinking</span>
     </div>
   );
 }

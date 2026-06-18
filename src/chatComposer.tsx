@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { ArrowUp, Loader2, X } from 'lucide-react';
@@ -43,7 +43,7 @@ type ChatComposerProps = {
   onGoalModeChange: (enabled: boolean) => void;
   onOpenSettings?: () => void;
   onOpenPlugins?: () => void;
-  onSend: (payload: ComposerSubmitPayload) => void | Promise<void>;
+  onSend: (payload: ComposerSubmitPayload) => boolean | Promise<boolean>;
   onNewThread: () => void;
 };
 
@@ -60,6 +60,14 @@ function readFileAsDataUrl(file: File): Promise<string> {
 
 function isImagePath(path: string) {
   return /\.(png|jpe?g|gif|webp|bmp|svg|heic|heif)$/i.test(path);
+}
+
+function normalizeSendText(value: string) {
+  return value.replace(/\r\n/g, '\n').trim();
+}
+
+function hasComposerContent(value: string) {
+  return value.trim().length > 0;
 }
 
 export const ChatComposer = React.memo(function ChatComposer({
@@ -88,9 +96,28 @@ export const ChatComposer = React.memo(function ChatComposer({
 }: ChatComposerProps) {
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const composingRef = useRef(false);
+  const justEndedCompositionRef = useRef(false);
+  const submittingRef = useRef(false);
+  const sendingRef = useRef(false);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
-  const sending = busy || waitingForReply;
+  const [hasText, setHasText] = useState(false);
+  const sending = busy;
   const placeholder = draftMode && projectName ? '随心输入' : 'Ask for follow-up changes';
+
+  useEffect(() => {
+    sendingRef.current = sending;
+  }, [sending]);
+
+  const syncInputState = useCallback((node: HTMLTextAreaElement | null) => {
+    setHasText(hasComposerContent(node?.value ?? ''));
+  }, []);
+
+  const resizeComposer = useCallback((node: HTMLTextAreaElement | null) => {
+    if (!node) return;
+    node.style.height = 'auto';
+    node.style.height = `${Math.min(node.scrollHeight, 180)}px`;
+  }, []);
 
   const addImageAttachment = useCallback(async (file: File) => {
     if (!file.type.startsWith(IMAGE_MIME_PREFIX)) return;
@@ -181,16 +208,80 @@ export const ChatComposer = React.memo(function ChatComposer({
     setAttachments((current) => current.filter((item) => item.id !== id));
   };
 
-  const submit = async () => {
-    const text = (inputRef.current?.value ?? '').trim();
-    if ((!text && attachments.length === 0) || sending) return;
-    if (inputRef.current) inputRef.current.value = '';
-    const payload = { text, attachments, planMode, goalMode };
-    setAttachments([]);
-    await onSend(payload);
-  };
+  const clearComposer = useCallback(() => {
+    const node = inputRef.current;
+    if (node) {
+      node.value = '';
+      node.style.height = 'auto';
+    }
+    setHasText(false);
+  }, []);
 
-  const canSend = !sending;
+  const restoreComposerText = useCallback(
+    (text: string) => {
+      const node = inputRef.current;
+      if (!node || node.value.trim()) return;
+      node.value = text;
+      syncInputState(node);
+      resizeComposer(node);
+      node.focus();
+    },
+    [resizeComposer, syncInputState],
+  );
+
+  const submitWithText = useCallback(
+    async (rawText: string) => {
+      if (submittingRef.current) return;
+      const text = normalizeSendText(rawText);
+      if (!text && attachments.length === 0) return;
+
+      const payload = {
+        text,
+        attachments: [...attachments],
+        planMode,
+        goalMode,
+      };
+      submittingRef.current = true;
+      try {
+        const accepted = await onSend(payload);
+        if (accepted !== true) {
+          restoreComposerText(text);
+          return;
+        }
+        clearComposer();
+        setAttachments([]);
+      } finally {
+        submittingRef.current = false;
+      }
+    },
+    [attachments, clearComposer, goalMode, onSend, planMode],
+  );
+
+  const submitFromDom = useCallback(() => {
+    const node = inputRef.current;
+    if (!node) return;
+    void submitWithText(node.value);
+  }, [submitWithText]);
+
+  const handleEnterKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.key !== 'Enter' || event.shiftKey) return;
+      if (event.nativeEvent.isComposing || composingRef.current || event.keyCode === 229) return;
+      if (justEndedCompositionRef.current) {
+        justEndedCompositionRef.current = false;
+        return;
+      }
+      event.preventDefault();
+      const snapshot = event.currentTarget.value;
+      window.setTimeout(() => {
+        const latest = inputRef.current?.value ?? snapshot;
+        void submitWithText(latest);
+      }, 0);
+    },
+    [submitWithText],
+  );
+
+  const canSend = hasText || attachments.length > 0;
 
   return (
     <div className="codex-composer">
@@ -222,13 +313,33 @@ export const ChatComposer = React.memo(function ChatComposer({
           className="codex-composer-input"
           rows={attachments.length > 0 ? 1 : 2}
           placeholder={placeholder}
-          onPaste={handlePaste}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault();
-              void submit();
-            }
+          defaultValue=""
+          onInput={(event) => {
+            syncInputState(event.currentTarget);
+            resizeComposer(event.currentTarget);
           }}
+          onPaste={(event) => {
+            void handlePaste(event);
+            window.setTimeout(() => {
+              const node = inputRef.current;
+              syncInputState(node);
+              resizeComposer(node);
+            }, 0);
+          }}
+          onCompositionStart={() => {
+            composingRef.current = true;
+            justEndedCompositionRef.current = false;
+          }}
+          onCompositionEnd={(event) => {
+            composingRef.current = false;
+            justEndedCompositionRef.current = true;
+            syncInputState(event.currentTarget);
+            resizeComposer(event.currentTarget);
+            window.setTimeout(() => {
+              justEndedCompositionRef.current = false;
+            }, 150);
+          }}
+          onKeyDown={handleEnterKeyDown}
         />
 
         <input
@@ -268,7 +379,7 @@ export const ChatComposer = React.memo(function ChatComposer({
               onModelChange={onModelChange}
               onEffortChange={onEffortChange}
             />
-            <button className="send-circle" onClick={() => void submit()} disabled={!canSend} type="button" title="发送">
+            <button className="send-circle" onClick={submitFromDom} disabled={!canSend} type="button" title="发送">
               {sending ? <Loader2 size={14} className="spin" /> : <ArrowUp size={14} />}
             </button>
           </div>
@@ -292,8 +403,9 @@ export function buildTurnInput(attachments: ComposerAttachment[], text: string) 
       input.push({ type: 'localImage', path: item.path });
     }
   }
-  if (text.trim()) {
-    input.push({ type: 'text', text: text.trim(), text_elements: [] });
+  const normalized = normalizeSendText(text);
+  if (normalized) {
+    input.push({ type: 'text', text: normalized, text_elements: [] });
   }
   return input;
 }

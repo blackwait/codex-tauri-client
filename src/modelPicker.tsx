@@ -123,7 +123,7 @@ export const ModelReasoningPicker = React.memo(function ModelReasoningPicker({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [showModels, setShowModels] = useState(false);
-  const { anchorRef, menuStyle } = useFloatingAnchor<HTMLButtonElement>(open, 'top-end');
+  const { anchorRef, menuStyle } = useFloatingAnchor<HTMLButtonElement>(open, 'top-end', menuRef, showModels);
 
   const activeModel = useMemo(
     () => models.find((item) => item.model === selectedModel) ?? models[0] ?? FALLBACK_MODELS[0],

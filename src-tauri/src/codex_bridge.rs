@@ -244,13 +244,8 @@ Make sure `codex` is installed and available on PATH."
     sandbox: Option<String>,
     timeout_secs: u64,
   ) -> Result<String, String> {
-    let request_id = self.send_thread_start(cwd, model, approval_policy, approvals_reviewer, sandbox)?;
-    let (tx, rx) = mpsc::channel();
-    self
-      .response_waiters
-      .lock()
-      .map_err(lock_error)?
-      .insert(request_id, tx);
+    let params = self.thread_start_params(cwd, model, approval_policy, approvals_reviewer, sandbox);
+    let rx = self.send_request_with_waiter("thread/start", params)?;
     let envelope = rx
       .recv_timeout(Duration::from_secs(timeout_secs))
       .map_err(|_| format!("thread/start timed out after {timeout_secs}s"))?;
@@ -265,6 +260,18 @@ Make sure `codex` is installed and available on PATH."
     approvals_reviewer: Option<String>,
     sandbox: Option<String>,
   ) -> Result<u64, String> {
+    let params = self.thread_start_params(cwd, model, approval_policy, approvals_reviewer, sandbox);
+    self.send_request("thread/start", params)
+  }
+
+  fn thread_start_params(
+    &self,
+    cwd: Option<String>,
+    model: Option<String>,
+    approval_policy: Option<Value>,
+    approvals_reviewer: Option<String>,
+    sandbox: Option<String>,
+  ) -> Value {
     let mut params = json!({
       "developerInstructions": "你是企业聊天客户端。优先直接回答用户问题；仅在用户明确要求时使用技能、工具或 MCP。简单对话不要加载或执行技能流程。",
       "personality": "pragmatic"
@@ -284,7 +291,7 @@ Make sure `codex` is installed and available on PATH."
     if let Some(sandbox) = sandbox {
       params["sandbox"] = Value::String(sandbox);
     }
-    self.send_request("thread/start", params)
+    params
   }
 
   pub fn list_threads(&self, cwd: Option<String>, search_term: Option<String>) -> Result<u64, String> {
@@ -309,6 +316,17 @@ Make sure `codex` is installed and available on PATH."
     self.send_request("thread/resume", json!({ "threadId": thread_id }))
   }
 
+  pub fn resume_thread_sync(&self, thread_id: String, timeout_secs: u64) -> Result<String, String> {
+    let rx = self.send_request_with_waiter("thread/resume", json!({ "threadId": thread_id }))?;
+    let envelope = rx
+      .recv_timeout(Duration::from_secs(timeout_secs))
+      .map_err(|_| format!("thread/resume timed out after {timeout_secs}s"))?;
+    if let Some(error) = &envelope.error {
+      return Err(error.to_string());
+    }
+    Ok(thread_id)
+  }
+
   pub fn read_thread(&self, thread_id: String, include_turns: bool) -> Result<u64, String> {
     self.send_request(
       "thread/read",
@@ -320,13 +338,13 @@ Make sure `codex` is installed and available on PATH."
   }
 
   pub fn read_thread_sync(&self, thread_id: String, include_turns: bool, timeout_secs: u64) -> Result<Value, String> {
-    let request_id = self.read_thread(thread_id, include_turns)?;
-    let (tx, rx) = mpsc::channel();
-    self
-      .response_waiters
-      .lock()
-      .map_err(lock_error)?
-      .insert(request_id, tx);
+    let rx = self.send_request_with_waiter(
+      "thread/read",
+      json!({
+        "threadId": thread_id,
+        "includeTurns": include_turns
+      }),
+    )?;
     let envelope = rx
       .recv_timeout(Duration::from_secs(timeout_secs))
       .map_err(|_| format!("thread/read timed out after {timeout_secs}s"))?;
@@ -350,6 +368,31 @@ Make sure `codex` is installed and available on PATH."
     approvals_reviewer: Option<String>,
     sandbox_policy: Option<Value>,
   ) -> Result<u64, String> {
+    let params = Self::turn_start_params(
+      thread_id,
+      text,
+      input,
+      cwd,
+      model,
+      effort,
+      approval_policy,
+      approvals_reviewer,
+      sandbox_policy,
+    )?;
+    self.send_request("turn/start", params)
+  }
+
+  fn turn_start_params(
+    thread_id: String,
+    text: Option<String>,
+    input: Option<Value>,
+    cwd: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    approval_policy: Option<Value>,
+    approvals_reviewer: Option<String>,
+    sandbox_policy: Option<Value>,
+  ) -> Result<Value, String> {
     let input_value = if let Some(input) = input {
       input
     } else if let Some(text) = text {
@@ -381,7 +424,41 @@ Make sure `codex` is installed and available on PATH."
     if let Some(sandbox_policy) = sandbox_policy {
       params["sandboxPolicy"] = sandbox_policy;
     }
-    self.send_request("turn/start", params)
+    Ok(params)
+  }
+
+  pub fn start_turn_sync(
+    &self,
+    thread_id: String,
+    text: Option<String>,
+    input: Option<Value>,
+    cwd: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    approval_policy: Option<Value>,
+    approvals_reviewer: Option<String>,
+    sandbox_policy: Option<Value>,
+    timeout_secs: u64,
+  ) -> Result<Value, String> {
+    let params = Self::turn_start_params(
+      thread_id,
+      text,
+      input,
+      cwd,
+      model,
+      effort,
+      approval_policy,
+      approvals_reviewer,
+      sandbox_policy,
+    )?;
+    let rx = self.send_request_with_waiter("turn/start", params)?;
+    let envelope = rx
+      .recv_timeout(Duration::from_secs(timeout_secs))
+      .map_err(|_| format!("turn/start timed out after {timeout_secs}s"))?;
+    if let Some(error) = &envelope.error {
+      return Err(error.to_string());
+    }
+    Ok(envelope.result.unwrap_or(Value::Null))
   }
 
   pub fn update_thread_settings(
@@ -665,6 +742,31 @@ Make sure `codex` is installed and available on PATH."
       .insert(id, method.to_string());
     self.write_message(json!({ "id": id, "method": method, "params": params }))?;
     Ok(id)
+  }
+
+  fn send_request_with_waiter(&self, method: &str, params: Value) -> Result<mpsc::Receiver<RpcEnvelope>, String> {
+    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::channel();
+    self
+      .pending
+      .lock()
+      .map_err(lock_error)?
+      .insert(id, method.to_string());
+    self
+      .response_waiters
+      .lock()
+      .map_err(lock_error)?
+      .insert(id, tx);
+    if let Err(error) = self.write_message(json!({ "id": id, "method": method, "params": params })) {
+      if let Ok(mut pending) = self.pending.lock() {
+        pending.remove(&id);
+      }
+      if let Ok(mut waiters) = self.response_waiters.lock() {
+        waiters.remove(&id);
+      }
+      return Err(error);
+    }
+    Ok(rx)
   }
 
   fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {

@@ -22,12 +22,15 @@ import {
   ThreadTimelineView,
   ThinkingShimmer,
   timelineFromThreadRead,
+  type TimelineAttachment,
   type TimelineItem,
 } from './threadTimeline';
 import {
   CalendarClock,
+  Bug,
   ChevronDown,
   ChevronRight,
+  Copy,
   FolderOpen,
   FolderPlus,
   MessageSquareText,
@@ -70,11 +73,30 @@ type RpcEnvelope = {
   params?: unknown;
 };
 
+type QueuedPrompt = ComposerSubmitPayload & {
+  id: string;
+  createdAt: number;
+};
+
+type DebugLogScope = 'lifecycle' | 'api' | 'execution' | 'queue' | 'error';
+
+type DebugLogEntry = {
+  id: string;
+  ts: number;
+  scope: DebugLogScope;
+  message: string;
+  data?: string;
+};
+
 const APP_NAME = '鱼泡codex';
 
 const MODEL_PREF_KEY = 'codex-tauri.model';
 const EFFORT_PREF_KEY = 'codex-tauri.effort';
 const PERMISSION_PREF_KEY = 'codex-tauri.permission-mode';
+const SIDEBAR_WIDTH_PREF_KEY = 'codex-tauri.sidebar-width';
+const SIDEBAR_WIDTH_DEFAULT = 248;
+const SIDEBAR_WIDTH_MIN = 220;
+const SIDEBAR_WIDTH_MAX = 420;
 
 type AppServerItem = {
   id?: string;
@@ -136,6 +158,15 @@ function readConfigValue(contents: string, key: string) {
   const regex = new RegExp(`^\\s*${escaped}\\s*=\\s*"?([^"\\n]+)"?\\s*$`, 'm');
   const match = contents.match(regex);
   return match?.[1]?.trim() ?? '';
+}
+
+function clampSidebarWidth(value: number) {
+  return Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, Math.round(value)));
+}
+
+function readSidebarWidth() {
+  const raw = Number(localStorage.getItem(SIDEBAR_WIDTH_PREF_KEY));
+  return Number.isFinite(raw) ? clampSidebarWidth(raw) : SIDEBAR_WIDTH_DEFAULT;
 }
 
 function upsertConfigValue(contents: string, key: string, value: string) {
@@ -223,6 +254,49 @@ function toPretty(value: unknown) {
   if (value == null) return '';
   if (typeof value === 'string') return value;
   return JSON.stringify(value, null, 2);
+}
+
+function compactForLog(value: unknown, maxLength = 2600) {
+  const text = toPretty(value);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}\n... truncated ${text.length - maxLength} chars`;
+}
+
+function debugScopeLabel(scope: DebugLogScope) {
+  const labels: Record<DebugLogScope, string> = {
+    lifecycle: '生命周期',
+    api: 'API',
+    execution: '执行',
+    queue: '队列',
+    error: '错误',
+  };
+  return labels[scope];
+}
+
+function formatDebugTime(ts: number) {
+  const date = new Date(ts);
+  const pad = (value: number, size = 2) => String(value).padStart(size, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+}
+
+function formatDebugLogEntry(entry: DebugLogEntry) {
+  const head = `[${formatDebugTime(entry.ts)}] [${debugScopeLabel(entry.scope)}] ${entry.message}`;
+  return entry.data ? `${head}\n${entry.data}` : head;
+}
+
+function queuedPromptTitle(prompt: QueuedPrompt) {
+  const text = prompt.text.trim().replace(/\s+/g, ' ');
+  if (text) return text.length > 72 ? `${text.slice(0, 72)}...` : text;
+  if (prompt.attachments.length > 0) return `${prompt.attachments.length} 个附件`;
+  return '空任务';
+}
+
+function queuedPromptMeta(prompt: QueuedPrompt) {
+  const parts = [`${formatDebugTime(prompt.createdAt)} 入队`];
+  if (prompt.planMode) parts.push('Plan');
+  if (prompt.goalMode) parts.push('Goal');
+  if (prompt.attachments.length > 0) parts.push(`${prompt.attachments.length} 个附件`);
+  return parts.join(' · ');
 }
 
 function getPayloadArray(value: unknown): unknown[] {
@@ -405,6 +479,40 @@ function translateMethod(method: string) {
   return map[method] ?? method;
 }
 
+function toolActivitySubtype(tool: string): string {
+  const normalized = tool.toLowerCase();
+  if (
+    normalized.includes('read') ||
+    normalized.includes('open') ||
+    normalized.includes('fetch') ||
+    normalized.includes('cat') ||
+    normalized.includes('sed')
+  ) {
+    return 'read';
+  }
+  if (
+    normalized.includes('search') ||
+    normalized.includes('grep') ||
+    normalized.includes('rg') ||
+    normalized.includes('find') ||
+    normalized.includes('glob')
+  ) {
+    return 'search';
+  }
+  if (normalized.includes('web') || normalized.includes('browser')) {
+    return 'webSearch';
+  }
+  return 'dynamicToolCall';
+}
+
+function toolActivityTitle(tool: string): string {
+  const subtype = toolActivitySubtype(tool);
+  if (subtype === 'read') return '读取文件';
+  if (subtype === 'search') return '搜索代码';
+  if (subtype === 'webSearch') return '搜索网页';
+  return `工具：${tool}`;
+}
+
 function extractThreadIdFromNotification(method: string | undefined, params: unknown): string | null {
   if (!method || !params || typeof params !== 'object') return null;
   if (method === 'thread/started') {
@@ -520,6 +628,16 @@ function sessionTitleFromInput(text: string, attachments: ComposerAttachment[]):
   if (trimmed) return formatSessionTitle(trimmed);
   if (attachments.length > 0) return formatSessionTitle('图片消息');
   return '新会话';
+}
+
+function timelineAttachmentsFromComposer(attachments: ComposerAttachment[]): TimelineAttachment[] {
+  return attachments.map((item) => ({
+    id: item.id,
+    kind: item.kind,
+    previewUrl: item.previewUrl ?? item.dataUrl,
+    path: item.path,
+    name: item.name,
+  }));
 }
 
 function encodeBase64Utf8(value: string) {
@@ -694,6 +812,7 @@ export default function App() {
   const [waitingForReply, setWaitingForReply] = useState(false);
   const [replyHint, setReplyHint] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState('');
+  const [, setServiceLog] = useState('');
   const replySlowTimerRef = useRef<number | null>(null);
   const replyTimeoutTimerRef = useRef<number | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -706,6 +825,8 @@ export default function App() {
   const [commitMessage, setCommitMessage] = useState<string>('');
   const [diffOpen, setDiffOpen] = useState<boolean>(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debugLogs, setDebugLogs] = useState<DebugLogEntry[]>([]);
   const [configSnapshot, setConfigSnapshot] = useState<CodexConfigSnapshot | null>(null);
   const [configDraft, setConfigDraft] = useState('');
   const [quickModel, setQuickModel] = useState('');
@@ -721,6 +842,7 @@ export default function App() {
   const [permissionMode, setPermissionMode] = useState<PermissionModeId>(
     () => (localStorage.getItem(PERMISSION_PREF_KEY) as PermissionModeId) || 'full-access',
   );
+  const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
   const [planMode, setPlanMode] = useState(false);
   const [goalMode, setGoalMode] = useState(false);
   const selectedModelRef = useRef(selectedModel);
@@ -738,6 +860,7 @@ export default function App() {
   const draftSessionRef = useRef(true);
   const sessionHydrateRef = useRef(false);
   const waitingForReplyRef = useRef(false);
+  const busyRef = useRef(false);
   const streamingTextRef = useRef('');
   const threadReadPollRef = useRef<number | null>(null);
   const replyPollTokenRef = useRef<string | null>(null);
@@ -753,6 +876,10 @@ export default function App() {
   const serviceLogRef = useRef<string>('');
   const serviceLogFlushTimerRef = useRef<number | null>(null);
   const serviceLogPendingRef = useRef<string>('');
+  const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
+  const queuedPromptsRef = useRef<QueuedPrompt[]>([]);
+  const queueDispatchingRef = useRef(false);
+  const debugLogsRef = useRef<DebugLogEntry[]>([]);
   const [turnIndex, setTurnIndex] = useState<number>(0);
   const turnIndexRef = useRef<number>(0);
   const [turnState, setTurnState] = useState<'idle' | 'thinking' | 'runningTools'>('idle');
@@ -763,6 +890,23 @@ export default function App() {
   const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState | null>(null);
 
   const commitAgentReplyRef = useRef<(body: string, finalize?: boolean) => void>(() => {});
+  const finalizeCurrentTurnTimeline = () => {
+    const currentTurnIndex = turnIndexRef.current;
+    setTimeline((current) =>
+      current.map((evt) =>
+        evt.turnIndex === currentTurnIndex && evt.completed === false
+          ? {
+              ...evt,
+              completed: true,
+              completedAt: evt.completedAt ?? Date.now(),
+              durationMs:
+                evt.durationMs ??
+                (evt.startedAt ? Math.max(0, Date.now() - evt.startedAt) : evt.durationMs),
+            }
+          : evt,
+      ),
+    );
+  };
   commitAgentReplyRef.current = (body: string, finalize = false) => {
     const text = body.trim();
     if (!text) return;
@@ -798,6 +942,7 @@ export default function App() {
       ];
     });
     if (finalize) {
+      finalizeCurrentTurnTimeline();
       streamingAgentRef.current = null;
       streamingToolRef.current.clear();
       latestDiffTimelineIdRef.current = null;
@@ -869,6 +1014,32 @@ export default function App() {
     localStorage.setItem(PERMISSION_PREF_KEY, permissionMode);
   }, [permissionMode]);
 
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_WIDTH_PREF_KEY, String(sidebarWidth));
+  }, [sidebarWidth]);
+
+  function handleSidebarResizePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+    document.body.classList.add('is-resizing-sidebar');
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      setSidebarWidth(clampSidebarWidth(startWidth + moveEvent.clientX - startX));
+    };
+    const handlePointerUp = () => {
+      document.body.classList.remove('is-resizing-sidebar');
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+  }
+
   async function refreshModelCatalog() {
     if (!isTauriRuntime) return;
     try {
@@ -936,6 +1107,18 @@ export default function App() {
   useEffect(() => {
     waitingForReplyRef.current = waitingForReply;
   }, [waitingForReply]);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
+    queuedPromptsRef.current = queuedPrompts;
+  }, [queuedPrompts]);
+
+  useEffect(() => {
+    debugLogsRef.current = debugLogs;
+  }, [debugLogs]);
 
   useEffect(() => {
     streamingTextRef.current = streamingText;
@@ -1027,11 +1210,18 @@ export default function App() {
     }
 
     invoke<CodexCheckResult>('codex_check')
-      .then((res) => setCodexCheck(res))
-      .catch((error) => setCodexCheck({ installed: false, error: String(error) }));
+      .then((res) => {
+        pushDebugLog('api', 'codex_check 完成', res);
+        setCodexCheck(res);
+      })
+      .catch((error) => {
+        pushDebugLog('error', 'codex_check 失败', error);
+        setCodexCheck({ installed: false, error: String(error) });
+      });
 
     invoke<Project[]>('projects_list')
       .then(async (rows) => {
+        pushDebugLog('api', `projects_list 完成，项目数 ${rows.length}`);
         setProjects(rows);
         if (rows.length === 0) {
           setSelectedProjectId(null);
@@ -1048,20 +1238,34 @@ export default function App() {
         projectPathRef.current = first.path;
         setExpandedProjectIds(new Set([first.id]));
         const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: first.id });
+        pushDebugLog('api', `sessions_for_project 完成，项目 ${first.id}，会话数 ${nextSessions.length}`);
         setSessions(nextSessions);
       })
       .catch((error) => {
+        pushDebugLog('error', '读取项目列表失败', error);
         setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'error', title: '读取项目列表失败', body: String(error) }]);
       });
 
     const registerListeners = async () => {
-      unsubs.push(await listen<CodexStatus>('codex:status', (event) => setStatus(event.payload)));
+      unsubs.push(await listen<CodexStatus>('codex:status', (event) => {
+        pushDebugLog('lifecycle', 'codex:status', event.payload);
+        setStatus(event.payload);
+      }));
       unsubs.push(
         await listen<RpcEnvelope>('codex:message', (event) => {
       const envelope = event.payload;
       const method = envelope.method;
       const requestMethod = envelope.request_method;
       let skipAppend = false;
+      const eventName = method ?? requestMethod ?? 'unknown';
+      pushDebugLog(eventName.startsWith('item/') || eventName.startsWith('turn/') ? 'execution' : 'api', eventName, {
+        id: envelope.id,
+        method,
+        requestMethod,
+        params: envelope.params,
+        result: envelope.result,
+        error: envelope.error,
+      });
 
       const approvalMethod = envelope.method;
       if (isServerApprovalRequest(approvalMethod) && envelope.id !== undefined && envelope.params && !envelope.result && !envelope.error) {
@@ -1420,9 +1624,10 @@ export default function App() {
               streamingToolRef.current.set(itemId, timelineId);
               const tool = typeof item.tool === 'string' ? item.tool : 'tool';
               const args = item.arguments ? `arguments:\n${toPretty(item.arguments)}\n` : '';
+              const subtype = toolActivitySubtype(tool);
               setTimeline((current) => [
                 ...current,
-                { id: timelineId, kind: 'tool', subtype: 'dynamicToolCall', title: `动态工具：${tool}`, command: tool, body: args, turnIndex: turnIndexRef.current, completed: false, ...mergeToolStarted() },
+                { id: timelineId, kind: 'tool', subtype, title: toolActivityTitle(tool), command: tool, body: args, turnIndex: turnIndexRef.current, completed: false, ...mergeToolStarted() },
               ]);
               return;
             }
@@ -1435,13 +1640,16 @@ export default function App() {
               const error = item.error ? `error:\n${toPretty(item.error)}` : '';
               const body = `${args}${success}${contentItems}${error}`.trim() || toPretty(item);
               const tid = streamingToolRef.current.get(itemId);
+              const subtype = toolActivitySubtype(tool);
               if (tid) {
                 setTimeline((current) =>
                   current.map((evt) =>
                     evt.id === tid
                       ? {
                           ...evt,
-                          title: `动态工具：${tool}${statusText}`,
+                          subtype,
+                          title: `${toolActivityTitle(tool)}${statusText}`,
+                          command: tool,
                           body,
                           completed: true,
                           ...mergeToolCompleted(item as Record<string, unknown>, evt),
@@ -1455,9 +1663,11 @@ export default function App() {
                   {
                     id: crypto.randomUUID(),
                     kind: 'tool',
-                    subtype: 'dynamicToolCall',
-                    title: `动态工具：${tool}${statusText}`,
+                    subtype,
+                    title: `${toolActivityTitle(tool)}${statusText}`,
+                    command: tool,
                     body,
+                    turnIndex: turnIndexRef.current,
                     completed: true,
                     ...mergeToolCompleted(item as Record<string, unknown>),
                   },
@@ -1563,6 +1773,7 @@ export default function App() {
       }
 
       if (method === 'turn/completed') {
+        finalizeCurrentTurnTimeline();
         setTurnTiming((current) => {
           const turnIndex = turnIndexRef.current;
           const existing = current[turnIndex];
@@ -1758,38 +1969,35 @@ export default function App() {
         ]);
       }
 
-        if (!skipAppend && shouldAppendEnvelopeToTimeline(envelope)) {
-          const item = classifyEnvelope(envelope);
-          setTimeline((current) => [...current, item]);
-        }
-        }),
+      if (!skipAppend && shouldAppendEnvelopeToTimeline(envelope)) {
+        const item = classifyEnvelope(envelope);
+        setTimeline((current) => [...current, item]);
+      }
+    }),
       );
       unsubs.push(
         await listen<{ line: string }>('codex:stderr', (event) => {
-      const line = event.payload.line;
-      if (!line) return;
-      const next = `${serviceLogPendingRef.current}${serviceLogPendingRef.current ? '\n' : ''}${line}`.split('\n').slice(-50).join('\n');
-      serviceLogPendingRef.current = next;
-      if (serviceLogFlushTimerRef.current != null) return;
-      serviceLogFlushTimerRef.current = window.setTimeout(() => {
-        serviceLogFlushTimerRef.current = null;
-        const flushed = serviceLogPendingRef.current;
-        if (!flushed || flushed === serviceLogRef.current) return;
-        serviceLogRef.current = flushed;
-        setTimeline((current) => {
-          const id = 'service-log';
-          const existingIdx = current.findIndex((it) => it.id === id);
-          const item = { id, kind: 'system' as const, title: '服务日志（最近50行）', body: flushed };
-          if (existingIdx === -1) return [...current, item];
-          const copy = current.slice();
-          copy[existingIdx] = item;
-          return copy;
-        });
-        }, 250);
+          const line = event.payload.line;
+          if (!line) return;
+          pushDebugLog('execution', 'codex:stderr', line);
+          const next = `${serviceLogPendingRef.current}${serviceLogPendingRef.current ? '\n' : ''}${line}`
+            .split('\n')
+            .slice(-50)
+            .join('\n');
+          serviceLogPendingRef.current = next;
+          if (serviceLogFlushTimerRef.current != null) return;
+          serviceLogFlushTimerRef.current = window.setTimeout(() => {
+            serviceLogFlushTimerRef.current = null;
+            const flushed = serviceLogPendingRef.current;
+            if (!flushed || flushed === serviceLogRef.current) return;
+            serviceLogRef.current = flushed;
+            setServiceLog(flushed);
+          }, 250);
         }),
       );
       unsubs.push(
         await listen<{ line: string; error: string }>('codex:unparsed', (event) => {
+          pushDebugLog('error', 'codex:unparsed', event.payload);
           setTimeline((current) => [
             ...current,
             { id: crypto.randomUUID(), kind: 'error', title: '无法解析的服务输出', body: `${event.payload.error}\n${event.payload.line}` },
@@ -1799,8 +2007,10 @@ export default function App() {
 
       if (!bootstrappedRef.current) {
         bootstrappedRef.current = true;
+        pushDebugLog('lifecycle', `${APP_NAME} 自动连接开始`);
         connectCodex(false)
           .then(async (connected) => {
+            pushDebugLog('lifecycle', `${APP_NAME} 自动连接${connected ? '成功' : '未完成'}`);
             if (!connected) return undefined;
             window.setTimeout(() => {
               refreshEnterpriseCapabilities().catch(() => {});
@@ -1829,6 +2039,13 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (threadId) return;
+    setServiceLog('');
+    serviceLogRef.current = '';
+    serviceLogPendingRef.current = '';
+  }, [threadId]);
+
   const activeConversation = useMemo(() => {
     if (!threadId) return null;
     return conversations.find((conversation) => conversation.id === threadId) ?? {
@@ -1839,7 +2056,19 @@ export default function App() {
     };
   }, [conversations, threadId]);
 
+  function pushDebugLog(scope: DebugLogScope, message: string, data?: unknown) {
+    const entry: DebugLogEntry = {
+      id: crypto.randomUUID(),
+      ts: Date.now(),
+      scope,
+      message,
+      data: data == null ? undefined : compactForLog(data),
+    };
+    setDebugLogs((current) => [...current, entry].slice(-500));
+  }
+
   function appendError(title: string, error: unknown) {
+    pushDebugLog('error', title, error);
     setTimeline((current) => [
       ...current,
       { id: crypto.randomUUID(), kind: 'error', title, body: String(error) },
@@ -2005,15 +2234,20 @@ export default function App() {
   async function resumeConversation(conversation: Conversation) {
     if (!(await connectCodex(false))) return;
     setThreadId(conversation.id);
+    threadIdRef.current = conversation.id;
+    draftSessionRef.current = false;
     setActiveNav('历史会话');
+    setBusy(true);
     try {
-      await invoke<number>('codex_resume_thread', { threadId: conversation.id });
+      await invoke<string>('codex_resume_thread_sync', { threadId: conversation.id });
       setTimeline((current) => [
         ...current,
         { id: crypto.randomUUID(), kind: 'system', title: '已恢复历史会话', body: conversation.title },
       ]);
     } catch (error) {
       appendError('恢复会话失败', error);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -2079,10 +2313,44 @@ export default function App() {
     return id;
   }
 
-  async function dispatchPrompt(payload: ComposerSubmitPayload) {
+  function enqueuePrompt(payload: ComposerSubmitPayload) {
+    const queued: QueuedPrompt = {
+      ...payload,
+      attachments: [...payload.attachments],
+      id: crypto.randomUUID(),
+      createdAt: Date.now(),
+    };
+    setQueuedPrompts((current) => [...current, queued]);
+    pushDebugLog('queue', '任务已入队', {
+      id: queued.id,
+      title: queuedPromptTitle(queued),
+      attachments: queued.attachments.map((item) => ({ kind: item.kind, name: item.name, path: item.path })),
+      planMode: queued.planMode,
+      goalMode: queued.goalMode,
+    });
+  }
+
+  function removeQueuedPrompt(id: string) {
+    setQueuedPrompts((current) => {
+      const removed = current.find((item) => item.id === id);
+      if (removed) pushDebugLog('queue', '移除排队任务', { id, title: queuedPromptTitle(removed) });
+      return current.filter((item) => item.id !== id);
+    });
+  }
+
+  function prioritizeQueuedPrompt(id: string) {
+    setQueuedPrompts((current) => {
+      const target = current.find((item) => item.id === id);
+      if (!target) return current;
+      pushDebugLog('queue', '排队任务已引导到队首', { id, title: queuedPromptTitle(target) });
+      return [target, ...current.filter((item) => item.id !== id)];
+    });
+  }
+
+  async function dispatchPrompt(payload: ComposerSubmitPayload): Promise<boolean> {
     const { text, attachments, planMode: nextPlanMode, goalMode: nextGoalMode } = payload;
     const trimmed = text.trim();
-    if (!trimmed && attachments.length === 0) return;
+    if (!trimmed && attachments.length === 0) return false;
 
     if (!threadIdRef.current) {
       const targetId = pendingCreateSessionProjectIdRef.current ?? selectedProjectIdRef.current;
@@ -2091,7 +2359,7 @@ export default function App() {
         const firstProject = getFirstProject();
         if (!firstProject) {
           promptAddProject();
-          return;
+          return false;
         }
         bindSessionProject(firstProject);
       } else {
@@ -2105,35 +2373,23 @@ export default function App() {
     }
 
     const pollToken = crypto.randomUUID();
-    replyPollTokenRef.current = pollToken;
     setBusy(true);
-    setWaitingForReply(true);
-    setStreamingText('');
-    streamingAgentRef.current = null;
-
-    const timelineBody =
-      attachments.length > 0
-        ? [trimmed, attachments.map((item) => `[${item.kind === 'image' ? '图片' : '文件'}] ${item.name}`).join('\n')]
-            .filter(Boolean)
-            .join('\n')
-        : trimmed;
-
-    pendingSessionTitleRef.current = sessionTitleFromInput(trimmed, attachments);
-
-    setTimeline((current) => [
-      ...current,
-      { id: crypto.randomUUID(), kind: 'user', title: '用户', body: timelineBody },
-    ]);
+    pushDebugLog('execution', '准备发送任务', {
+      text: trimmed,
+      attachments: attachments.map((item) => ({ kind: item.kind, name: item.name, path: item.path })),
+      planMode: nextPlanMode,
+      goalMode: nextGoalMode,
+      projectPath: projectPathRef.current || projectPath || null,
+      threadId: threadIdRef.current,
+    });
 
     try {
       if (!(await connectCodex(false))) {
-        replyPollTokenRef.current = null;
-        setWaitingForReply(false);
         setTimeline((current) => [
           ...current,
           { id: crypto.randomUUID(), kind: 'agent', title: '助手', body: '连接失败，请确认 Codex CLI 已安装且可运行。' },
         ]);
-        return;
+        return false;
       }
 
       const activeThreadId = await ensureThreadId();
@@ -2153,28 +2409,75 @@ export default function App() {
         projectPath || null,
       );
       const turnInput = buildTurnInput(attachments, promptText);
+      if (turnInput.length === 0) return false;
 
-      await invoke<number>('codex_start_turn', {
+      replyPollTokenRef.current = pollToken;
+      pushDebugLog('api', 'codex_start_turn 调用', {
         threadId: activeThreadId,
-        text: null,
-        input: turnInput,
+        inputCount: turnInput.length,
         cwd: projectPath || null,
         model: selectedModelRef.current || null,
         effort: selectedEffortRef.current || null,
-        approvalPolicy: permissionSettings?.approvalPolicy ?? null,
-        approvalsReviewer: permissionSettings?.approvalsReviewer ?? null,
-        sandboxPolicy: permissionSettings?.sandboxPolicy ?? null,
+        permissionSettings,
       });
-      void syncPollAgentReply(activeThreadId, pollToken);
-    } catch (error) {
-      replyPollTokenRef.current = null;
-      threadWarmupRef.current = null;
-      setWaitingForReply(false);
+      setWaitingForReply(true);
       setStreamingText('');
+      streamingAgentRef.current = null;
+
+      const fileAttachmentLines = attachments
+        .filter((item) => item.kind !== 'image')
+        .map((item) => `[文件] ${item.name}`);
+      const timelineBody = [trimmed, fileAttachmentLines.join('\n')].filter(Boolean).join('\n');
+      const timelineAttachments = timelineAttachmentsFromComposer(attachments);
+
+      pendingSessionTitleRef.current = sessionTitleFromInput(trimmed, attachments);
+
+      setTimeline((current) => [
+        ...current,
+        { id: crypto.randomUUID(), kind: 'user', title: '用户', body: timelineBody, attachments: timelineAttachments },
+      ]);
+
+      try {
+        await invoke<number>('codex_start_turn', {
+          threadId: activeThreadId,
+          text: null,
+          input: turnInput,
+          cwd: projectPath || null,
+          model: selectedModelRef.current || null,
+          effort: selectedEffortRef.current || null,
+          approvalPolicy: permissionSettings?.approvalPolicy ?? null,
+          approvalsReviewer: permissionSettings?.approvalsReviewer ?? null,
+          sandboxPolicy: permissionSettings?.sandboxPolicy ?? null,
+        });
+        pushDebugLog('api', 'codex_start_turn 已提交', { threadId: activeThreadId });
+      } catch (error) {
+        pushDebugLog('error', 'codex_start_turn 失败', error);
+        replyPollTokenRef.current = null;
+        setWaitingForReply(false);
+        setStreamingText('');
+        setTimeline((current) => {
+          const trimmedTimeline =
+            current.length > 0 && current[current.length - 1]?.kind === 'user'
+              ? current.slice(0, -1)
+              : current;
+          return [
+            ...trimmedTimeline,
+            { id: crypto.randomUUID(), kind: 'agent', title: '助手', body: `发送失败：${String(error)}` },
+          ];
+        });
+        return false;
+      }
+
+      void syncPollAgentReply(activeThreadId, pollToken);
+      return true;
+    } catch (error) {
+      pushDebugLog('error', '发送任务失败', error);
+      threadWarmupRef.current = null;
       setTimeline((current) => [
         ...current,
         { id: crypto.randomUUID(), kind: 'agent', title: '助手', body: `发送失败：${String(error)}` },
       ]);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -2479,14 +2782,45 @@ export default function App() {
     }
   }
 
-  async function sendPrompt(payload: ComposerSubmitPayload) {
+  async function sendPrompt(payload: ComposerSubmitPayload): Promise<boolean> {
     const text = payload.text.trim();
     if (text.startsWith('/') && payload.attachments.length === 0) {
+      if (waitingForReplyRef.current || busyRef.current) {
+        appendError('当前任务执行中', 'Slash 命令需要当前任务结束后再执行。普通任务会自动进入队列。');
+        return false;
+      }
       await executeSlashCommand(text);
-      return;
+      return true;
     }
-    await dispatchPrompt(payload);
+    if (waitingForReplyRef.current || busyRef.current) {
+      enqueuePrompt(payload);
+      return true;
+    }
+    return dispatchPrompt(payload);
   }
+
+  useEffect(() => {
+    if (waitingForReply || busy || queuedPrompts.length === 0 || queueDispatchingRef.current) return;
+    const next = queuedPrompts[0];
+    queueDispatchingRef.current = true;
+    setQueuedPrompts((current) => current.slice(1));
+    pushDebugLog('queue', '开始执行排队任务', { id: next.id, title: queuedPromptTitle(next) });
+    void dispatchPrompt({
+      text: next.text,
+      attachments: next.attachments,
+      planMode: next.planMode,
+      goalMode: next.goalMode,
+    })
+      .then((accepted) => {
+        if (!accepted) pushDebugLog('queue', '排队任务未被接受', { id: next.id, title: queuedPromptTitle(next) });
+      })
+      .catch((error) => {
+        pushDebugLog('error', '排队任务执行异常', error);
+      })
+      .finally(() => {
+        queueDispatchingRef.current = false;
+      });
+  }, [busy, queuedPrompts, waitingForReply]);
 
   async function interrupt() {
     if (!threadId) return;
@@ -2782,22 +3116,39 @@ export default function App() {
     const project = projectsRef.current.find((p) => p.id === session.project_id);
     if (project) {
       setSelectedProjectId(project.id);
+      selectedProjectIdRef.current = project.id;
       setProjectPath(session.worktree_path || project.path);
+      projectPathRef.current = session.worktree_path || project.path;
       setSessionMode(session.mode === 'worktree' ? 'worktree' : 'local');
       invoke('project_touch', { projectId: project.id, now: nowSeconds() }).catch(() => {});
     }
+    setBusy(true);
     draftSessionRef.current = false;
     sessionHydrateRef.current = true;
-    setThreadId(session.thread_id);
+    setPendingApprovals([]);
+    setTurnTiming({});
+    setTimeline([]);
+    setWaitingForReply(false);
+    setStreamingText('');
+    streamingAgentRef.current = null;
+    streamingToolRef.current.clear();
+    latestDiffTimelineIdRef.current = null;
+    setTurnState('idle');
     setActiveNav('历史会话');
-    setBusy(true);
     try {
-      await connectCodex(false);
-      await invoke<number>('codex_resume_thread', { threadId: session.thread_id });
-      await invoke<number>('codex_read_thread', { threadId: session.thread_id, includeTurns: true });
+      if (!(await connectCodex(false))) return;
+      setThreadId(session.thread_id);
+      threadIdRef.current = session.thread_id;
+      await invoke<string>('codex_resume_thread_sync', { threadId: session.thread_id });
+      const result = await invoke<unknown>('codex_read_thread_sync', { threadId: session.thread_id, includeTurns: true });
+      setTimeline(timelineFromThreadRead(result));
+      setThreadGitInfo(extractThreadGitInfo(result));
+      setThreadSettingsView(extractThreadSettings(result));
+      sessionHydrateRef.current = false;
     } catch (error) {
       appendError('打开会话失败', error);
     } finally {
+      sessionHydrateRef.current = false;
       setBusy(false);
     }
   }
@@ -3271,9 +3622,23 @@ export default function App() {
   );
 
   const showProjectHero = draftMode && visibleTimeline.length === 0 && !waitingForReply && !showThinkingShimmer;
+  const debugLogText = debugLogs.map(formatDebugLogEntry).join('\n\n');
+
+  async function copyDebugLogs() {
+    const text = debugLogText || '暂无日志';
+    try {
+      await navigator.clipboard.writeText(text);
+      pushDebugLog('lifecycle', 'Debug 日志已复制');
+    } catch (error) {
+      appendError('复制 Debug 日志失败', error);
+    }
+  }
 
   return (
-    <div className="app-shell codex-shell">
+    <div
+      className="app-shell codex-shell"
+      style={{ '--sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}
+    >
       <aside className="sidebar codex-sidebar">
         <nav className="nav-stack">
           {navItems.map((item) => {
@@ -3481,6 +3846,14 @@ export default function App() {
           设置
         </button>
       </aside>
+      <div
+        className="sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整侧边栏宽度"
+        title="拖动调整侧边栏宽度"
+        onPointerDown={handleSidebarResizePointerDown}
+      />
 
       <ProjectContextMenu
         menu={projectContextMenu}
@@ -3502,7 +3875,17 @@ export default function App() {
         {threadId && !showProjectHero ? (
           <header className="thread-header">
             <h1>{activeThreadTitle}</h1>
+            <button className="debug-trigger" onClick={() => setDebugOpen(true)} type="button" title="打开 Debug 日志">
+              <Bug size={14} />
+              Debug
+            </button>
           </header>
+        ) : null}
+        {!threadId || showProjectHero ? (
+          <button className="debug-trigger debug-trigger-floating" onClick={() => setDebugOpen(true)} type="button" title="打开 Debug 日志">
+            <Bug size={14} />
+            Debug
+          </button>
         ) : null}
 
         <section className="thread-body">
@@ -3535,6 +3918,38 @@ export default function App() {
                 </div>
               )}
             </div>
+            {queuedPrompts.length > 0 ? (
+              <div className="queued-prompt-stack" aria-label="排队任务">
+                {queuedPrompts.map((queued, index) => (
+                  <div key={queued.id} className="queued-prompt-card">
+                    <div className="queued-prompt-index">↳</div>
+                    <div className="queued-prompt-copy">
+                      <div className="queued-prompt-title">{queuedPromptTitle(queued)}</div>
+                      {index === 0 ? <div className="queued-prompt-meta">{queuedPromptMeta(queued)}</div> : null}
+                    </div>
+                    <button
+                      className="queued-prompt-action"
+                      type="button"
+                      onClick={() => prioritizeQueuedPrompt(queued.id)}
+                      title="优先执行这条消息"
+                    >
+                      ↪ 引导
+                    </button>
+                    <button
+                      className="queued-prompt-remove"
+                      type="button"
+                      onClick={() => removeQueuedPrompt(queued.id)}
+                      title="移除排队任务"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                    <button className="queued-prompt-more" type="button" title="更多">
+                      ...
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <ChatComposer
               busy={busy}
               waitingForReply={waitingForReply}
@@ -3561,6 +3976,33 @@ export default function App() {
             />
           </div>
         </section>
+
+        {debugOpen && (
+          <div className="debug-overlay">
+            <div className="debug-panel">
+              <div className="debug-header">
+                <div>
+                  <h2>Debug 日志</h2>
+                  <p>{debugLogs.length} 条 · API 调用 / 生命周期 / 当前执行内容</p>
+                </div>
+                <button className="settings-close" onClick={() => setDebugOpen(false)} type="button">关闭</button>
+              </div>
+              <div className="debug-actions">
+                <button onClick={copyDebugLogs} type="button">
+                  <Copy size={14} />
+                  复制日志
+                </button>
+                <button onClick={() => setDebugLogs([])} type="button">清空</button>
+              </div>
+              <textarea
+                className="debug-log-textarea"
+                value={debugLogText || '暂无日志'}
+                readOnly
+                spellCheck={false}
+              />
+            </div>
+          </div>
+        )}
 
         {settingsOpen && (
           <div className="settings-overlay">

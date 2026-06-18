@@ -6,6 +6,8 @@ export type FloatingPlacement = 'top-end' | 'top-start';
 export function useFloatingAnchor<T extends HTMLElement = HTMLElement>(
   open: boolean,
   placement: FloatingPlacement = 'top-end',
+  menuRef?: RefObject<HTMLElement | null>,
+  layoutKey?: unknown,
 ) {
   const anchorRef = useRef<T | null>(null);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
@@ -17,6 +19,7 @@ export function useFloatingAnchor<T extends HTMLElement = HTMLElement>(
       const node = anchorRef.current;
       if (!node) return;
       const rect = node.getBoundingClientRect();
+      const menuWidth = menuRef?.current?.offsetWidth ?? 0;
       const next: CSSProperties = {
         position: 'fixed',
         zIndex: 2000,
@@ -25,9 +28,23 @@ export function useFloatingAnchor<T extends HTMLElement = HTMLElement>(
         top: 'auto',
       };
       if (placement === 'top-end') {
-        next.right = Math.max(8, window.innerWidth - rect.right);
+        let right = Math.max(8, window.innerWidth - rect.right);
+        if (menuWidth > 0) {
+          const menuLeft = window.innerWidth - right - menuWidth;
+          if (menuLeft < 8) {
+            right = Math.max(8, window.innerWidth - menuWidth - 8);
+          }
+        }
+        next.right = right;
       } else {
-        next.left = Math.max(8, rect.left);
+        let left = Math.max(8, rect.left);
+        if (menuWidth > 0) {
+          const menuRight = left + menuWidth;
+          if (menuRight > window.innerWidth - 8) {
+            left = Math.max(8, window.innerWidth - menuWidth - 8);
+          }
+        }
+        next.left = left;
         next.right = 'auto';
       }
       setMenuStyle(next);
@@ -36,11 +53,20 @@ export function useFloatingAnchor<T extends HTMLElement = HTMLElement>(
     update();
     window.addEventListener('resize', update);
     window.addEventListener('scroll', update, true);
+
+    const menuNode = menuRef?.current;
+    const resizeObserver =
+      menuNode && typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(update)
+        : undefined;
+    resizeObserver?.observe(menuNode!);
+
     return () => {
       window.removeEventListener('resize', update);
       window.removeEventListener('scroll', update, true);
+      resizeObserver?.disconnect();
     };
-  }, [open, placement]);
+  }, [open, placement, menuRef, layoutKey]);
 
   return { anchorRef, menuStyle };
 }
