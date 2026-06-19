@@ -172,7 +172,7 @@ export const ModelReasoningPicker = React.memo(function ModelReasoningPicker({
       </button>
 
       <FloatingMenuPortal open={open} menuStyle={menuStyle} menuRef={menuRef} className="model-picker-anchor">
-        <div className="model-picker-stack">
+        <div className={showModels ? 'model-picker-stack model-picker-stack-sub-open' : 'model-picker-stack'}>
           <div className="model-picker-panel">
             <div className="model-picker-title">推理</div>
             {effortOptions.map((effort) => (

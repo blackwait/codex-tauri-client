@@ -13,11 +13,17 @@ export type TimelineAttachment = {
   name: string;
 };
 
+export type TimelinePlanStep = {
+  step: string;
+  status: 'pending' | 'inProgress' | 'completed';
+};
+
 export type TimelineItem = {
   id: string;
   kind: 'agent' | 'user' | 'tool' | 'system' | 'error' | 'approval';
   title: string;
   body: string;
+  planSteps?: TimelinePlanStep[];
   attachments?: TimelineAttachment[];
   subtype?: string;
   turnIndex?: number;
@@ -313,10 +319,37 @@ function ProcessIcon({ kind, running }: { kind: ProcessKind; running: boolean })
 }
 
 function toolDetail(tool: TimelineItem) {
+  if (tool.subtype === 'todoList' && tool.planSteps?.length) {
+    const active = activePlanStep(tool.planSteps);
+    return active ? active.step : `${tool.planSteps.length} 个步骤`;
+  }
   const body = tool.body?.trim() ?? '';
   if (tool.command) return truncateCommand(tool.command, 90);
   const firstLine = body.split('\n').find(Boolean);
   return firstLine ? truncateCommand(firstLine, 90) : tool.title;
+}
+
+function activePlanStep(steps: TimelinePlanStep[]) {
+  return steps.find((step) => step.status === 'inProgress') ?? steps.find((step) => step.status === 'pending') ?? steps[steps.length - 1] ?? null;
+}
+
+function planStepIndex(steps: TimelinePlanStep[]) {
+  const index = steps.findIndex((step) => step.status === 'inProgress');
+  if (index >= 0) return index;
+  const pendingIndex = steps.findIndex((step) => step.status === 'pending');
+  if (pendingIndex >= 0) return pendingIndex;
+  return Math.max(0, steps.length - 1);
+}
+
+function planStatusLabel(status: TimelinePlanStep['status']) {
+  switch (status) {
+    case 'completed':
+      return '已完成';
+    case 'inProgress':
+      return '执行中';
+    default:
+      return '待执行';
+  }
 }
 
 function processSummary(tools: TimelineItem[], active: boolean, now: number) {
@@ -360,6 +393,27 @@ function processSummary(tools: TimelineItem[], active: boolean, now: number) {
   return parts.join('并') || '已处理';
 }
 
+function mergeAgentItems(items: TimelineItem[]) {
+  const merged: TimelineItem[] = [];
+  for (const item of items) {
+    const existing = merged.find(
+      (candidate) =>
+        candidate.body === item.body ||
+        candidate.body.includes(item.body) ||
+        item.body.includes(candidate.body),
+    );
+    if (!existing) {
+      merged.push(item);
+      continue;
+    }
+    if (item.body.length > existing.body.length) {
+      existing.body = item.body;
+    }
+    existing.completed = existing.completed !== false && item.completed !== false;
+  }
+  return merged;
+}
+
 export function isThreadRenderable(event: TimelineItem) {
   return event.kind === 'user' || event.kind === 'agent' || event.kind === 'tool';
 }
@@ -383,7 +437,7 @@ export function groupTimelineItems(
       type: 'assistant-turn',
       turnIndex,
       tools: visibleTools,
-      agents: bucket.agents,
+      agents: mergeAgentItems(bucket.agents),
       timing: turnTiming[turnIndex],
     });
     buckets.delete(turnIndex);
@@ -744,13 +798,14 @@ const AssistantTurnRow = React.memo(function AssistantTurnRow({
         ? Date.now() - timing.startedAt
         : null;
 
-  const processedLabel =
-    durationMs != null
-      ? `已处理 ${formatDurationMs(durationMs)}`
-      : toolsRunning || active
-        ? '处理中…'
-        : '已处理';
+  const isRunning = toolsRunning || active;
+  const processedLabel = isRunning ? '正在执行' : '已完成';
+  const durationLabel = durationMs != null ? formatDurationMs(durationMs) : null;
   const summaryLabel = processSummary(metaTools, Boolean(active), now);
+  const activePlan = metaTools.find((tool) => tool.subtype === 'todoList' && tool.planSteps?.length);
+  const activePlanSteps = activePlan?.planSteps ?? [];
+  const activePlanIndex = activePlanSteps.length > 0 ? planStepIndex(activePlanSteps) : -1;
+  const statusClassName = isRunning ? 'turn-status-badge running' : 'turn-status-badge completed';
 
   if (!hasMeta && agents.length === 0) return null;
 
@@ -760,14 +815,39 @@ const AssistantTurnRow = React.memo(function AssistantTurnRow({
         {hasMeta ? (
           <div className={toolsRunning ? 'turn-meta running' : 'turn-meta'}>
             <button type="button" className="turn-meta-toggle" onClick={() => setMetaOpen((value) => !value)}>
-              <span className="turn-meta-status">{processedLabel}</span>
-              <span className="turn-meta-summary">{summaryLabel}</span>
+              {activePlanSteps.length > 0 ? (
+                <>
+                  <span className={activePlanSteps[activePlanIndex]?.status === 'inProgress' ? 'turn-step-spinner running' : 'turn-step-spinner'} />
+                  <span className={statusClassName}>{processedLabel}</span>
+                  <span className="turn-meta-status">{`第 ${activePlanIndex + 1} / ${activePlanSteps.length} 步`}</span>
+                  <span className="turn-meta-summary">{summaryLabel}</span>
+                  {durationLabel ? <span className="turn-meta-duration">{durationLabel}</span> : null}
+                </>
+              ) : (
+                <>
+                  <span className={statusClassName}>{processedLabel}</span>
+                  {durationLabel ? <span className="turn-meta-duration">{durationLabel}</span> : null}
+                  <span className="turn-meta-summary">{summaryLabel}</span>
+                </>
+              )}
               <ChevronDown size={14} className={showMetaBody ? 'turn-chevron open' : 'turn-chevron'} />
             </button>
             {showMetaBody ? (
               <div className="turn-meta-body">
+                {activePlanSteps.length > 0 ? (
+                  <ol className="turn-plan-steps">
+                    {activePlanSteps.map((step, index) => (
+                      <li key={`${step.status}-${index}-${step.step}`} className={`turn-plan-step ${step.status}`}>
+                        <span className={step.status === 'inProgress' ? 'turn-plan-step-dot running' : 'turn-plan-step-dot'} />
+                        <span className="turn-plan-step-text">{step.step}</span>
+                        <span className="turn-plan-step-status">{planStatusLabel(step.status)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
                 <ul className="process-list">
                   {metaTools.map((tool) => {
+                    if (tool.subtype === 'todoList' && tool.planSteps?.length) return null;
                     const kind = processKind(tool);
                     const running = tool.completed === false;
                     const shimmer = running && (kind === 'command' || kind === 'reasoning');

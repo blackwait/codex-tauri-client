@@ -24,6 +24,7 @@ import {
   timelineFromThreadRead,
   type TimelineAttachment,
   type TimelineItem,
+  type TimelinePlanStep,
 } from './threadTimeline';
 import {
   CalendarClock,
@@ -73,6 +74,18 @@ type RpcEnvelope = {
   params?: unknown;
 };
 
+type RetryNotification = {
+  requestId: number;
+  method: string;
+  attempt: number;
+  delaySecs: number;
+  infinite: boolean;
+};
+
+type ClientConfig = {
+  infinite_retry: boolean;
+};
+
 type QueuedPrompt = ComposerSubmitPayload & {
   id: string;
   createdAt: number;
@@ -115,6 +128,10 @@ function asItem(params: unknown): AppServerItem | null {
   const candidate = (direct.item ?? params) as any;
   if (!candidate || typeof candidate !== 'object') return null;
   return candidate as AppServerItem;
+}
+
+function normalizePlanStepStatus(status: unknown): TimelinePlanStep['status'] {
+  return status === 'inProgress' || status === 'completed' ? status : 'pending';
 }
 
 function itemTitle(itemType: string | undefined) {
@@ -260,6 +277,25 @@ function compactForLog(value: unknown, maxLength = 2600) {
   const text = toPretty(value);
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength)}\n... truncated ${text.length - maxLength} chars`;
+}
+
+function tailText(value: string, maxLength = 60000) {
+  if (value.length <= maxLength) return value;
+  return `... truncated ${value.length - maxLength} chars\n${value.slice(-maxLength)}`;
+}
+
+function compactEnvelopeForLog(envelope: RpcEnvelope) {
+  return {
+    id: envelope.id,
+    method: envelope.method,
+    requestMethod: envelope.request_method,
+    hasParams: envelope.params != null,
+    hasResult: envelope.result != null,
+    hasError: envelope.error != null,
+    paramsPreview: envelope.params == null ? undefined : compactForLog(envelope.params, 600),
+    resultPreview: envelope.result == null ? undefined : compactForLog(envelope.result, 600),
+    errorPreview: envelope.error == null ? undefined : compactForLog(envelope.error, 1200),
+  };
 }
 
 function debugScopeLabel(scope: DebugLogScope) {
@@ -832,6 +868,7 @@ export default function App() {
   const [quickModel, setQuickModel] = useState('');
   const [quickApproval, setQuickApproval] = useState('');
   const [quickSandbox, setQuickSandbox] = useState('');
+  const [infiniteRetry, setInfiniteRetry] = useState(false);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>(FALLBACK_MODELS);
   const [selectedModel, setSelectedModel] = useState(
     () => localStorage.getItem(MODEL_PREF_KEY) || FALLBACK_MODELS[0].model,
@@ -868,9 +905,12 @@ export default function App() {
   const projectPathRef = useRef('');
   const projectsRef = useRef<Project[]>([]);
   const sessionsRef = useRef<SessionRow[]>([]);
-  const streamingAgentRef = useRef<{ itemId: string; timelineId: string } | null>(null);
+  const streamingAgentRef = useRef<{ itemId: string | null; timelineId: string; source: 'stream' | 'snapshot' } | null>(null);
+  const streamingDeltaTextRef = useRef('');
+  const streamingSnapshotTextRef = useRef('');
   const streamingToolRef = useRef<Map<string, string>>(new Map());
   const latestDiffTimelineIdRef = useRef<string | null>(null);
+  const latestPlanTimelineIdRef = useRef<string | null>(null);
   const execPendingRequestIdRef = useRef<number | null>(null);
   const execProcessIdRef = useRef<string | null>(null);
   const serviceLogRef = useRef<string>('');
@@ -890,6 +930,15 @@ export default function App() {
   const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState | null>(null);
 
   const commitAgentReplyRef = useRef<(body: string, finalize?: boolean) => void>(() => {});
+  const findMergeableAgent = (items: TimelineItem[], text: string, targetTurnIndex: number) =>
+    [...items]
+      .reverse()
+      .find(
+        (item) =>
+          item.kind === 'agent' &&
+          item.turnIndex === targetTurnIndex &&
+          (item.completed === false || item.body === text || item.body.includes(text) || text.includes(item.body)),
+      );
   const finalizeCurrentTurnTimeline = () => {
     const currentTurnIndex = turnIndexRef.current;
     setTimeline((current) =>
@@ -911,13 +960,17 @@ export default function App() {
     const text = body.trim();
     if (!text) return;
     setStreamingText(text);
+    streamingTextRef.current = text;
+    if (!finalize) {
+      streamingSnapshotTextRef.current = text;
+    }
     setTimeline((current) => {
       const stream = streamingAgentRef.current;
       if (stream) {
         const exists = current.some((evt) => evt.id === stream.timelineId);
         if (exists) {
           return current.map((evt) =>
-            evt.id === stream.timelineId ? { ...evt, body: text, completed: true } : evt,
+            evt.id === stream.timelineId ? { ...evt, body: text, completed: finalize ? true : false } : evt,
           );
         }
         return [
@@ -928,27 +981,37 @@ export default function App() {
             title: '助手',
             body: text,
             turnIndex: turnIndexRef.current,
-            completed: true,
+            completed: finalize ? true : false,
           },
         ];
       }
-      const duplicate = current.some((item) => item.kind === 'agent' && item.body === text);
-      if (duplicate) return current;
+      const mergeTarget = findMergeableAgent(current, text, turnIndexRef.current);
+      if (mergeTarget) {
+        const nextBody = text.length >= mergeTarget.body.length ? text : mergeTarget.body;
+        streamingAgentRef.current = { itemId: null, timelineId: mergeTarget.id, source: 'snapshot' };
+        return current.map((item) =>
+          item.id === mergeTarget.id ? { ...item, body: nextBody, completed: finalize ? true : false } : item,
+        );
+      }
       const id = crypto.randomUUID();
-      streamingAgentRef.current = { itemId: id, timelineId: id };
+      streamingAgentRef.current = { itemId: null, timelineId: id, source: 'snapshot' };
       return [
         ...current,
-        { id, kind: 'agent' as const, title: '助手', body: text, turnIndex: turnIndexRef.current, completed: true },
+        { id, kind: 'agent' as const, title: '助手', body: text, turnIndex: turnIndexRef.current, completed: finalize ? true : false },
       ];
     });
     if (finalize) {
       finalizeCurrentTurnTimeline();
       streamingAgentRef.current = null;
+      streamingDeltaTextRef.current = '';
+      streamingSnapshotTextRef.current = '';
       streamingToolRef.current.clear();
       latestDiffTimelineIdRef.current = null;
+      latestPlanTimelineIdRef.current = null;
       setTurnState('idle');
       setWaitingForReply(false);
       setStreamingText('');
+      streamingTextRef.current = '';
     }
   };
 
@@ -1258,14 +1321,7 @@ export default function App() {
       const requestMethod = envelope.request_method;
       let skipAppend = false;
       const eventName = method ?? requestMethod ?? 'unknown';
-      pushDebugLog(eventName.startsWith('item/') || eventName.startsWith('turn/') ? 'execution' : 'api', eventName, {
-        id: envelope.id,
-        method,
-        requestMethod,
-        params: envelope.params,
-        result: envelope.result,
-        error: envelope.error,
-      });
+      pushDebugLog(eventName.startsWith('item/') || eventName.startsWith('turn/') ? 'execution' : 'api', eventName, compactEnvelopeForLog(envelope));
 
       const approvalMethod = envelope.method;
       if (isServerApprovalRequest(approvalMethod) && envelope.id !== undefined && envelope.params && !envelope.result && !envelope.error) {
@@ -1283,8 +1339,12 @@ export default function App() {
           return next;
         });
         setStreamingText('');
+        streamingTextRef.current = '';
+        streamingDeltaTextRef.current = '';
+        streamingSnapshotTextRef.current = '';
         streamingAgentRef.current = null;
         streamingToolRef.current.clear();
+        latestPlanTimelineIdRef.current = null;
         setTurnState('thinking');
         setWaitingForReply(true);
         return;
@@ -1305,26 +1365,50 @@ export default function App() {
         if (delta) {
           const itemId = params.itemId ?? '';
           const stream = streamingAgentRef.current;
-          if (!stream || (itemId && stream.itemId !== itemId)) {
+          if (!stream || (itemId && stream.itemId && stream.itemId !== itemId)) {
             const timelineId = crypto.randomUUID();
-            streamingAgentRef.current = { itemId: itemId || timelineId, timelineId };
+            streamingAgentRef.current = { itemId: itemId || timelineId, timelineId, source: 'stream' };
+            streamingDeltaTextRef.current = delta;
+            streamingSnapshotTextRef.current = '';
             setStreamingText(delta);
-            setTimeline((current) => [
-              ...current,
-              {
-                id: timelineId,
-                kind: 'agent',
-                title: '助手',
-                body: delta,
-                turnIndex: turnIndexRef.current,
-                completed: false,
-              },
-            ]);
+            streamingTextRef.current = delta;
+            setTimeline((current) => {
+              const mergeTarget = findMergeableAgent(current, delta, turnIndexRef.current);
+              if (mergeTarget) {
+                streamingAgentRef.current = { itemId: itemId || mergeTarget.id, timelineId: mergeTarget.id, source: 'stream' };
+                const nextBody = mergeTarget.body.includes(delta) ? mergeTarget.body : delta;
+                return current.map((item) =>
+                  item.id === mergeTarget.id ? { ...item, body: nextBody, completed: false } : item,
+                );
+              }
+              return [
+                ...current,
+                {
+                  id: timelineId,
+                  kind: 'agent',
+                  title: '助手',
+                  body: delta,
+                  turnIndex: turnIndexRef.current,
+                  completed: false,
+                },
+              ];
+            });
           } else {
-            setStreamingText((prev) => prev + delta);
+            if (stream && itemId && !stream.itemId) {
+              streamingAgentRef.current = { ...stream, itemId, source: 'stream' };
+            }
+            const nextDeltaText = streamingDeltaTextRef.current + delta;
+            streamingDeltaTextRef.current = nextDeltaText;
+            const snapshot = streamingSnapshotTextRef.current;
+            const nextText =
+              snapshot && snapshot.startsWith(nextDeltaText) && nextDeltaText.length < snapshot.length
+                ? snapshot
+                : nextDeltaText;
+            setStreamingText(nextText);
+            streamingTextRef.current = nextText;
             setTimeline((current) =>
               current.map((evt) =>
-                evt.id === stream.timelineId ? { ...evt, body: evt.body + delta, completed: false } : evt,
+                evt.id === stream.timelineId ? { ...evt, body: nextText, completed: false } : evt,
               ),
             );
           }
@@ -1353,7 +1437,7 @@ export default function App() {
         const delta = params.deltaBase64 ? decodeBase64Utf8(params.deltaBase64) : '';
         if (delta) {
           const prefix = params.stream === 'stderr' ? '[stderr] ' : '';
-          setExecLog((prev) => `${prev}${prefix}${delta}`);
+          setExecLog((prev) => tailText(`${prev}${prefix}${delta}`));
           // Avoid appending timeline rows per chunk (hot path).
           void processId;
         }
@@ -1683,26 +1767,46 @@ export default function App() {
       if (method === 'turn/plan/updated' && envelope.params) {
         const params = envelope.params as {
           explanation?: string | null;
-          plan?: Array<{ step?: string; status?: string }>;
+          plan?: Array<{ step?: string; status?: 'pending' | 'inProgress' | 'completed' }>;
         };
-        const steps = (params.plan ?? [])
-          .map((step) => `- [${step.status ?? 'pending'}] ${step.step ?? ''}`.trim())
-          .filter(Boolean)
-          .join('\n');
-        const body = [params.explanation ?? '', steps].filter(Boolean).join('\n\n');
-        if (body) {
-          setTimeline((current) => [
-            ...current,
-            {
-              id: crypto.randomUUID(),
-              kind: 'tool',
-              subtype: 'todoList',
-              title: '任务计划',
-              body,
-              turnIndex: turnIndexRef.current,
-              completed: true,
-            },
-          ]);
+        const planSteps: TimelinePlanStep[] = (params.plan ?? [])
+          .map((step) => ({
+            step: typeof step.step === 'string' ? step.step.trim() : '',
+            status: normalizePlanStepStatus(step.status),
+          }))
+          .filter((step) => step.step);
+        const body = params.explanation?.trim() ?? '';
+        if (body || planSteps.length > 0) {
+          setTimeline((current) => {
+            const existing = latestPlanTimelineIdRef.current;
+            if (existing && current.some((evt) => evt.id === existing)) {
+              return current.map((evt) =>
+                evt.id === existing
+                  ? {
+                      ...evt,
+                      body,
+                      planSteps,
+                      completed: !planSteps.some((step) => step.status === 'inProgress' || step.status === 'pending'),
+                    }
+                  : evt,
+              );
+            }
+            const id = crypto.randomUUID();
+            latestPlanTimelineIdRef.current = id;
+            return [
+              ...current,
+              {
+                id,
+                kind: 'tool',
+                subtype: 'todoList',
+                title: '任务计划',
+                body,
+                planSteps,
+                turnIndex: turnIndexRef.current,
+                completed: !planSteps.some((step) => step.status === 'inProgress' || step.status === 'pending'),
+              },
+            ];
+          });
         }
         return;
       }
@@ -1787,6 +1891,7 @@ export default function App() {
           streamingAgentRef.current = null;
           streamingToolRef.current.clear();
           latestDiffTimelineIdRef.current = null;
+          latestPlanTimelineIdRef.current = null;
           setTurnState('idle');
           setWaitingForReply(false);
           setStreamingText('');
@@ -1942,7 +2047,7 @@ export default function App() {
         const stderr = typeof result.stderr === 'string' ? result.stderr : '';
         const exitCode = typeof result.exitCode === 'number' ? result.exitCode : -1;
         const finalChunk = [stdout, stderr, `(exit ${exitCode})`].filter(Boolean).join('\n');
-        if (finalChunk) setExecLog((prev) => `${prev}${prev ? '\n' : ''}${finalChunk}\n`);
+        if (finalChunk) setExecLog((prev) => tailText(`${prev}${prev ? '\n' : ''}${finalChunk}\n`));
         setExecRunning(false);
         setExecProcessId(null);
         execPendingRequestIdRef.current = null;
@@ -1993,6 +2098,21 @@ export default function App() {
             serviceLogRef.current = flushed;
             setServiceLog(flushed);
           }, 250);
+        }),
+      );
+      unsubs.push(
+        await listen<RetryNotification>('codex:retry', (event) => {
+          const retry = event.payload;
+          pushDebugLog('api', `${retry.method} 请求重试`, retry);
+          setTimeline((current) => [
+            ...current,
+            {
+              id: crypto.randomUUID(),
+              kind: 'system',
+              title: '请求重试',
+              body: `${retry.method} 第 ${retry.attempt} 次请求将在 ${retry.delaySecs} 秒后发起${retry.infinite ? '（无限重试）' : ''}。`,
+            },
+          ]);
         }),
       );
       unsubs.push(
@@ -2064,7 +2184,7 @@ export default function App() {
       message,
       data: data == null ? undefined : compactForLog(data),
     };
-    setDebugLogs((current) => [...current, entry].slice(-500));
+    setDebugLogs((current) => [...current, entry].slice(-200));
   }
 
   function appendError(title: string, error: unknown) {
@@ -2929,9 +3049,6 @@ export default function App() {
     setTimeline([]);
     setSessionsListExpanded(false);
     try {
-      await invoke('project_touch', { projectId: project.id, now: nowSeconds() });
-      const nextProjects = await invoke<Project[]>('projects_list');
-      setProjects(nextProjects);
       const nextSessions = await invoke<SessionRow[]>('sessions_for_project', { projectId: project.id });
       setSessions(nextSessions);
       await connectCodex(false);
@@ -3064,6 +3181,7 @@ export default function App() {
       setQuickModel(readConfigValue(snapshot.contents, 'model'));
       setQuickApproval(readConfigValue(snapshot.contents, 'approval_policy'));
       setQuickSandbox(readConfigValue(snapshot.contents, 'sandbox'));
+      setInfiniteRetry(await invoke<boolean>('codex_get_infinite_retry'));
       await refreshEnterpriseCapabilities();
     } catch (error) {
       appendError('读取配置失败', error);
@@ -3078,6 +3196,25 @@ export default function App() {
       setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'system', title: '配置已保存', body: snapshot.path }]);
     } catch (error) {
       appendError('保存配置失败', error);
+    }
+  }
+
+  async function toggleInfiniteRetry(enabled: boolean) {
+    setInfiniteRetry(enabled);
+    try {
+      await invoke<ClientConfig>('codex_set_infinite_retry', { enabled });
+      setTimeline((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          kind: 'system',
+          title: '无限重试已更新',
+          body: enabled ? '遇到 429 或临时请求失败时，每 10 秒自动重试。' : '已恢复为最多 5 次退避重试。',
+        },
+      ]);
+    } catch (error) {
+      setInfiniteRetry(!enabled);
+      appendError('更新无限重试失败', error);
     }
   }
 
@@ -3120,7 +3257,6 @@ export default function App() {
       setProjectPath(session.worktree_path || project.path);
       projectPathRef.current = session.worktree_path || project.path;
       setSessionMode(session.mode === 'worktree' ? 'worktree' : 'local');
-      invoke('project_touch', { projectId: project.id, now: nowSeconds() }).catch(() => {});
     }
     setBusy(true);
     draftSessionRef.current = false;
@@ -3466,7 +3602,7 @@ export default function App() {
       execPendingRequestIdRef.current = requestId;
       setExecRunning(true);
       setExecProcessId(processId);
-      setExecLog((prev) => `${prev}${prev ? '\n' : ''}$ ${cmd}\n`);
+      setExecLog((prev) => tailText(`${prev}${prev ? '\n' : ''}$ ${cmd}\n`));
       setTimeline((current) => [...current, { id: crypto.randomUUID(), kind: 'tool', title: 'Exec', body: `$ ${cmd}` }]);
     } catch (error) {
       appendError('执行命令失败', error);
@@ -3952,9 +4088,6 @@ export default function App() {
             ) : null}
             <ChatComposer
               busy={busy}
-              waitingForReply={waitingForReply}
-              streamingText={streamingText}
-              replyHint={replyHint}
               connected={status.running}
               projectName={selectedProject?.name ?? null}
               draftMode={draftMode}
@@ -4041,6 +4174,17 @@ export default function App() {
                 </div>
                 <button onClick={applyQuickSettingsToDraft}>应用快捷配置到草稿</button>
               </div>
+              <label className="settings-toggle-row">
+                <span>
+                  <strong>无限重试</strong>
+                  <small>开启后，遇到 429 或临时请求失败时每 10 秒自动重试；关闭时最多请求 5 次。</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={infiniteRetry}
+                  onChange={(event) => void toggleInfiniteRetry(event.target.checked)}
+                />
+              </label>
               <textarea
                 className="settings-editor"
                 value={configDraft}

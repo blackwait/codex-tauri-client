@@ -11,6 +11,9 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
+const RETRY_DELAYS_SECS: [u64; 4] = [2, 5, 10, 20];
+const INFINITE_RETRY_DELAY_SECS: u64 = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexConnectionStatus {
   pub running: bool,
@@ -27,6 +30,14 @@ pub struct RpcEnvelope {
   pub result: Option<Value>,
   pub error: Option<Value>,
   pub params: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRequest {
+  method: String,
+  params: Value,
+  client_id: u64,
+  attempt: u32,
 }
 
 #[derive(Debug)]
@@ -78,7 +89,8 @@ pub fn codex_command() -> Command {
 #[derive(Debug)]
 pub struct CodexBridgeState {
   process: Mutex<Option<CodexProcess>>,
-  pending: Mutex<HashMap<u64, String>>,
+  pending: Mutex<HashMap<u64, PendingRequest>>,
+  retry_aliases: Mutex<HashMap<u64, u64>>,
   response_waiters: Mutex<HashMap<u64, mpsc::Sender<RpcEnvelope>>>,
   next_id: AtomicU64,
   initialized: Mutex<bool>,
@@ -90,6 +102,7 @@ impl CodexBridgeState {
     Self {
       process: Mutex::new(None),
       pending: Mutex::new(HashMap::new()),
+      retry_aliases: Mutex::new(HashMap::new()),
       response_waiters: Mutex::new(HashMap::new()),
       next_id: AtomicU64::new(1),
       initialized: Mutex::new(false),
@@ -739,7 +752,15 @@ Make sure `codex` is installed and available on PATH."
       .pending
       .lock()
       .map_err(lock_error)?
-      .insert(id, method.to_string());
+      .insert(
+        id,
+        PendingRequest {
+          method: method.to_string(),
+          params: params.clone(),
+          client_id: id,
+          attempt: 1,
+        },
+      );
     self.write_message(json!({ "id": id, "method": method, "params": params }))?;
     Ok(id)
   }
@@ -751,7 +772,15 @@ Make sure `codex` is installed and available on PATH."
       .pending
       .lock()
       .map_err(lock_error)?
-      .insert(id, method.to_string());
+      .insert(
+        id,
+        PendingRequest {
+          method: method.to_string(),
+          params: params.clone(),
+          client_id: id,
+          attempt: 1,
+        },
+      );
     self
       .response_waiters
       .lock()
@@ -787,17 +816,35 @@ Make sure `codex` is installed and available on PATH."
       .map_err(|err| format!("failed to write to codex app-server: {err}"))
   }
 
-  fn handle_stdout_line(&self, app: &AppHandle, line: String) {
+  fn handle_stdout_line(self: &Arc<Self>, app: &AppHandle, line: String) {
     match serde_json::from_str::<RpcEnvelope>(&line) {
       Ok(mut envelope) => {
         if let Some(id) = envelope.id {
-          if let Ok(mut waiters) = self.response_waiters.lock() {
-            if let Some(tx) = waiters.remove(&id) {
-              let _ = tx.send(envelope.clone());
+          let alias_client_id = self
+            .retry_aliases
+            .lock()
+            .ok()
+            .and_then(|mut aliases| aliases.remove(&id));
+          let client_id = alias_client_id.unwrap_or(id);
+          let pending_request = self.pending.lock().ok().and_then(|pending| pending.get(&client_id).cloned());
+
+          if let Some(request) = pending_request {
+            envelope.request_method = Some(request.method.clone());
+            envelope.id = Some(request.client_id);
+            if let Some(error) = &envelope.error {
+              if self.schedule_retry_if_needed(app, &request, &error.to_string()) {
+                return;
+              }
             }
-          }
-          if let Ok(mut pending) = self.pending.lock() {
-            envelope.request_method = pending.remove(&id);
+
+            if let Ok(mut pending) = self.pending.lock() {
+              pending.remove(&request.client_id);
+            }
+            if let Ok(mut waiters) = self.response_waiters.lock() {
+              if let Some(tx) = waiters.remove(&request.client_id) {
+                let _ = tx.send(envelope.clone());
+              }
+            }
           }
         }
         let _ = app.emit("codex:message", envelope);
@@ -823,6 +870,81 @@ Make sure `codex` is installed and available on PATH."
       *guard = false;
     }
   }
+
+  fn schedule_retry_if_needed(self: &Arc<Self>, app: &AppHandle, request: &PendingRequest, error_text: &str) -> bool {
+    if !is_retryable_error(error_text) {
+      return false;
+    }
+
+    let infinite_retry = crate::config::infinite_retry_enabled();
+    let delay_secs = if infinite_retry {
+      INFINITE_RETRY_DELAY_SECS
+    } else if let Some(delay) = RETRY_DELAYS_SECS.get(request.attempt.saturating_sub(1) as usize) {
+      *delay
+    } else {
+      return false;
+    };
+    let next_attempt = request.attempt + 1;
+
+    if let Ok(mut pending) = self.pending.lock() {
+      if let Some(stored) = pending.get_mut(&request.client_id) {
+        stored.attempt = next_attempt;
+      }
+    }
+
+    let payload = json!({
+      "requestId": request.client_id,
+      "method": request.method,
+      "attempt": next_attempt,
+      "delaySecs": delay_secs,
+      "infinite": infinite_retry
+    });
+    let _ = app.emit("codex:retry", payload);
+
+    let state = Arc::clone(self);
+    let client_id = request.client_id;
+    thread::spawn(move || {
+      thread::sleep(Duration::from_secs(delay_secs));
+      let _ = state.retry_request(client_id);
+    });
+    true
+  }
+
+  fn retry_request(&self, client_id: u64) -> Result<(), String> {
+    let request = self
+      .pending
+      .lock()
+      .map_err(lock_error)?
+      .get(&client_id)
+      .cloned()
+      .ok_or_else(|| "retry request is no longer pending".to_string())?;
+    let retry_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    self
+      .retry_aliases
+      .lock()
+      .map_err(lock_error)?
+      .insert(retry_id, request.client_id);
+    self.write_message(json!({
+      "id": retry_id,
+      "method": request.method,
+      "params": request.params
+    }))?;
+    Ok(())
+  }
+}
+
+fn is_retryable_error(error_text: &str) -> bool {
+  let lower = error_text.to_lowercase();
+  lower.contains("429")
+    || lower.contains("too many requests")
+    || lower.contains("rate limit")
+    || lower.contains("exceeded retry limit")
+    || lower.contains("timed out")
+    || lower.contains("timeout")
+    || lower.contains("temporarily unavailable")
+    || lower.contains("connection reset")
+    || lower.contains("connection refused")
+    || lower.contains("network")
 }
 
 fn lock_error<T>(err: std::sync::PoisonError<T>) -> String {

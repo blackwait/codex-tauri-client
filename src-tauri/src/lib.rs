@@ -6,7 +6,7 @@ mod paths;
 mod terminal;
 
 use codex_bridge::{CodexBridgeState, CodexConnectionStatus};
-use config::CodexConfigSnapshot;
+use config::{ClientConfig, CodexConfigSnapshot};
 use db::{DbPath, ProjectRow, SessionRow};
 use git::{GitChangedFile, GitSnapshot};
 use serde_json::Value;
@@ -386,6 +386,16 @@ fn codex_write_config(contents: String) -> Result<CodexConfigSnapshot, String> {
 }
 
 #[tauri::command]
+fn codex_get_infinite_retry() -> bool {
+  config::infinite_retry_enabled()
+}
+
+#[tauri::command]
+fn codex_set_infinite_retry(enabled: bool) -> Result<ClientConfig, String> {
+  config::set_infinite_retry_enabled(enabled)
+}
+
+#[tauri::command]
 fn terminal_run_readonly(cwd: String, command: String) -> Result<CommandOutput, String> {
   terminal::run_readonly(cwd, command)
 }
@@ -626,6 +636,8 @@ pub fn run() {
       git_revert_path,
       codex_read_config,
       codex_write_config,
+      codex_get_infinite_retry,
+      codex_set_infinite_retry,
       terminal_run_readonly,
       codex_check,
       project_add,

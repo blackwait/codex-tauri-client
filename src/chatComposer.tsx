@@ -24,9 +24,6 @@ export type ComposerSubmitPayload = {
 
 type ChatComposerProps = {
   busy: boolean;
-  waitingForReply: boolean;
-  streamingText: string;
-  replyHint: string | null;
   connected: boolean;
   projectName: string | null;
   draftMode: boolean;
@@ -48,6 +45,8 @@ type ChatComposerProps = {
 };
 
 const IMAGE_MIME_PREFIX = 'image/';
+const PROMPT_HISTORY_KEY = 'codex-tauri.prompt-history';
+const PROMPT_HISTORY_LIMIT = 100;
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -70,11 +69,21 @@ function hasComposerContent(value: string) {
   return value.trim().length > 0;
 }
 
+function readPromptHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePromptHistory(history: string[]) {
+  localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(history.slice(-PROMPT_HISTORY_LIMIT)));
+}
+
 export const ChatComposer = React.memo(function ChatComposer({
   busy,
-  waitingForReply,
-  streamingText,
-  replyHint,
   connected,
   projectName,
   draftMode,
@@ -100,6 +109,9 @@ export const ChatComposer = React.memo(function ChatComposer({
   const justEndedCompositionRef = useRef(false);
   const submittingRef = useRef(false);
   const sendingRef = useRef(false);
+  const promptHistoryRef = useRef<string[]>(readPromptHistory());
+  const historyCursorRef = useRef<number | null>(null);
+  const historyDraftRef = useRef('');
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [hasText, setHasText] = useState(false);
   const sending = busy;
@@ -215,6 +227,34 @@ export const ChatComposer = React.memo(function ChatComposer({
       node.style.height = 'auto';
     }
     setHasText(false);
+    historyCursorRef.current = null;
+    historyDraftRef.current = '';
+  }, []);
+
+  const replaceComposerText = useCallback(
+    (text: string) => {
+      const node = inputRef.current;
+      if (!node) return;
+      node.value = text;
+      syncInputState(node);
+      resizeComposer(node);
+      window.setTimeout(() => {
+        node.selectionStart = node.value.length;
+        node.selectionEnd = node.value.length;
+      }, 0);
+    },
+    [resizeComposer, syncInputState],
+  );
+
+  const rememberPrompt = useCallback((text: string) => {
+    const normalized = normalizeSendText(text);
+    if (!normalized) return;
+    const withoutDuplicate = promptHistoryRef.current.filter((item) => item !== normalized);
+    const next = [...withoutDuplicate, normalized].slice(-PROMPT_HISTORY_LIMIT);
+    promptHistoryRef.current = next;
+    writePromptHistory(next);
+    historyCursorRef.current = null;
+    historyDraftRef.current = '';
   }, []);
 
   const restoreComposerText = useCallback(
@@ -248,6 +288,7 @@ export const ChatComposer = React.memo(function ChatComposer({
           restoreComposerText(text);
           return;
         }
+        rememberPrompt(text);
         clearComposer();
         setAttachments([]);
       } finally {
@@ -263,8 +304,43 @@ export const ChatComposer = React.memo(function ChatComposer({
     void submitWithText(node.value);
   }, [submitWithText]);
 
-  const handleEnterKeyDown = useCallback(
+  const handleComposerKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (
+        (event.key === 'ArrowUp' || event.key === 'ArrowDown') &&
+        !event.shiftKey &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey
+      ) {
+        const history = promptHistoryRef.current;
+        if (history.length > 0) {
+          const cursor = historyCursorRef.current;
+          event.preventDefault();
+          if (cursor === null) {
+            historyDraftRef.current = event.currentTarget.value;
+          }
+          if (event.key === 'ArrowUp') {
+            const nextCursor = cursor === null ? history.length - 1 : Math.max(0, cursor - 1);
+            historyCursorRef.current = nextCursor;
+            replaceComposerText(history[nextCursor] ?? '');
+          } else if (cursor !== null) {
+            const nextCursor = cursor + 1;
+            if (nextCursor >= history.length) {
+              historyCursorRef.current = null;
+              replaceComposerText(historyDraftRef.current);
+            } else {
+              historyCursorRef.current = nextCursor;
+              replaceComposerText(history[nextCursor] ?? '');
+            }
+          }
+        }
+        return;
+      }
+
+      historyCursorRef.current = null;
+      historyDraftRef.current = '';
+
       if (event.key !== 'Enter' || event.shiftKey) return;
       if (event.nativeEvent.isComposing || composingRef.current || event.keyCode === 229) return;
       if (justEndedCompositionRef.current) {
@@ -278,7 +354,7 @@ export const ChatComposer = React.memo(function ChatComposer({
         void submitWithText(latest);
       }, 0);
     },
-    [submitWithText],
+    [replaceComposerText, submitWithText],
   );
 
   const canSend = hasText || attachments.length > 0;
@@ -315,6 +391,8 @@ export const ChatComposer = React.memo(function ChatComposer({
           placeholder={placeholder}
           defaultValue=""
           onInput={(event) => {
+            historyCursorRef.current = null;
+            historyDraftRef.current = '';
             syncInputState(event.currentTarget);
             resizeComposer(event.currentTarget);
           }}
@@ -339,7 +417,7 @@ export const ChatComposer = React.memo(function ChatComposer({
               justEndedCompositionRef.current = false;
             }, 150);
           }}
-          onKeyDown={handleEnterKeyDown}
+          onKeyDown={handleComposerKeyDown}
         />
 
         <input
@@ -386,9 +464,6 @@ export const ChatComposer = React.memo(function ChatComposer({
         </div>
       </div>
 
-      {waitingForReply || streamingText ? (
-        <div className="composer-hint">{streamingText || replyHint || '思考中…'}</div>
-      ) : null}
     </div>
   );
 });

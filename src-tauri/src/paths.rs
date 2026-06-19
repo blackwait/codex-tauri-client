@@ -22,3 +22,7 @@ pub fn codex_config_path() -> Result<PathBuf, String> {
   }
   Ok(home_dir()?.join(".codex").join("config.toml"))
 }
+
+pub fn client_config_path() -> Result<PathBuf, String> {
+  Ok(home_dir()?.join(".codex-tauri-client").join("config.json"))
+}

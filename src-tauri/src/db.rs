@@ -177,7 +177,7 @@ pub fn list_projects(db: &DbPath) -> Result<Vec<ProjectRow>, String> {
   let conn = open_conn(&db.0)?;
   let mut stmt = conn
     .prepare(
-      "SELECT id, path, name, created_at, pinned FROM projects ORDER BY pinned DESC, COALESCE(last_opened_at, created_at) DESC",
+      "SELECT id, path, name, created_at, pinned FROM projects ORDER BY pinned DESC, created_at DESC, id DESC",
     )
     .map_err(|e| format!("prepare list projects failed: {e}"))?;
   let rows = stmt
@@ -338,4 +338,3 @@ pub fn clear_session_worktree(db: &DbPath, project_id: i64, thread_id: String) -
     .map_err(|e| format!("clear session worktree failed: {e}"))?;
   Ok(())
 }
-
