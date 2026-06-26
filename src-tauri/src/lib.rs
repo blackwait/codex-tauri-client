@@ -159,13 +159,19 @@ fn codex_list_models_sync(state: State<'_, SharedCodexBridge>) -> Result<serde_j
 }
 
 #[tauri::command]
-fn codex_steer_turn(state: State<'_, SharedCodexBridge>, thread_id: String, text: String) -> Result<u64, String> {
-  state.0.steer_turn(thread_id, text)
+fn codex_steer_turn(
+  state: State<'_, SharedCodexBridge>,
+  thread_id: String,
+  turn_id: String,
+  text: Option<String>,
+  input: Option<serde_json::Value>,
+) -> Result<u64, String> {
+  state.0.steer_turn(thread_id, turn_id, text, input)
 }
 
 #[tauri::command]
-fn codex_interrupt_turn(state: State<'_, SharedCodexBridge>, thread_id: String) -> Result<u64, String> {
-  state.0.interrupt_turn(thread_id)
+fn codex_interrupt_turn(state: State<'_, SharedCodexBridge>, thread_id: String, turn_id: String) -> Result<u64, String> {
+  state.0.interrupt_turn(thread_id, turn_id)
 }
 
 #[tauri::command]
@@ -191,6 +197,11 @@ fn codex_fork_thread(state: State<'_, SharedCodexBridge>, thread_id: String, cwd
 #[tauri::command]
 fn codex_rollback_thread(state: State<'_, SharedCodexBridge>, thread_id: String, num_turns: u64) -> Result<u64, String> {
   state.0.rollback_thread(thread_id, num_turns)
+}
+
+#[tauri::command]
+fn codex_compact_thread(state: State<'_, SharedCodexBridge>, thread_id: String) -> Result<u64, String> {
+  state.0.compact_thread(thread_id)
 }
 
 #[tauri::command]
@@ -539,7 +550,7 @@ fn open_path(path: String) -> Result<(), String> {
     return Err("路径不能为空".to_string());
   }
   if !std::path::Path::new(trimmed).exists() {
-    return Err(format!("目录不存在: {trimmed}"));
+    return Err(format!("路径不存在: {trimmed}"));
   }
 
   #[cfg(target_os = "macos")]
@@ -547,7 +558,7 @@ fn open_path(path: String) -> Result<(), String> {
     std::process::Command::new("open")
       .arg(trimmed)
       .spawn()
-      .map_err(|e| format!("打开目录失败: {e}"))?;
+      .map_err(|e| format!("打开路径失败: {e}"))?;
   }
 
   #[cfg(target_os = "windows")]
@@ -555,7 +566,7 @@ fn open_path(path: String) -> Result<(), String> {
     std::process::Command::new("explorer")
       .arg(trimmed)
       .spawn()
-      .map_err(|e| format!("打开目录失败: {e}"))?;
+      .map_err(|e| format!("打开路径失败: {e}"))?;
   }
 
   #[cfg(all(unix, not(target_os = "macos")))]
@@ -563,10 +574,25 @@ fn open_path(path: String) -> Result<(), String> {
     std::process::Command::new("xdg-open")
       .arg(trimmed)
       .spawn()
-      .map_err(|e| format!("打开目录失败: {e}"))?;
+      .map_err(|e| format!("打开路径失败: {e}"))?;
   }
 
   Ok(())
+}
+
+#[tauri::command]
+fn open_parent_path(path: String) -> Result<(), String> {
+  let trimmed = path.trim();
+  if trimmed.is_empty() {
+    return Err("路径不能为空".to_string());
+  }
+  let target = std::path::Path::new(trimmed);
+  let dir = if target.is_dir() {
+    target
+  } else {
+    target.parent().ok_or_else(|| format!("无法获取父目录: {trimmed}"))?
+  };
+  open_path(dir.to_string_lossy().to_string())
 }
 
 pub fn run() {
@@ -608,6 +634,7 @@ pub fn run() {
       codex_unarchive_thread,
       codex_fork_thread,
       codex_rollback_thread,
+      codex_compact_thread,
       codex_set_thread_goal,
       codex_get_thread_goal,
       codex_clear_thread_goal,
@@ -650,6 +677,7 @@ pub fn run() {
       project_set_pinned,
       project_remove,
       open_path,
+      open_parent_path,
       project_touch,
       worktree_create,
       worktree_remove,

@@ -522,18 +522,32 @@ Make sure `codex` is installed and available on PATH."
       .ok_or_else(|| "model/list returned no result".to_string())
   }
 
-  pub fn steer_turn(&self, thread_id: String, text: String) -> Result<u64, String> {
+  pub fn steer_turn(
+    &self,
+    thread_id: String,
+    turn_id: String,
+    text: Option<String>,
+    input: Option<Value>,
+  ) -> Result<u64, String> {
+    let input_value = if let Some(input) = input {
+      input
+    } else if let Some(text) = text {
+      json!([{ "type": "text", "text": text, "text_elements": [] }])
+    } else {
+      return Err("turn/steer requires text or input".to_string());
+    };
     self.send_request(
       "turn/steer",
       json!({
         "threadId": thread_id,
-        "input": [{ "type": "text", "text": text }]
+        "expectedTurnId": turn_id,
+        "input": input_value
       }),
     )
   }
 
-  pub fn interrupt_turn(&self, thread_id: String) -> Result<u64, String> {
-    self.send_request("turn/interrupt", json!({ "threadId": thread_id }))
+  pub fn interrupt_turn(&self, thread_id: String, turn_id: String) -> Result<u64, String> {
+    self.send_request("turn/interrupt", json!({ "threadId": thread_id, "turnId": turn_id }))
   }
 
   pub fn set_thread_name(&self, thread_id: String, name: String) -> Result<u64, String> {
@@ -558,6 +572,10 @@ Make sure `codex` is installed and available on PATH."
 
   pub fn rollback_thread(&self, thread_id: String, num_turns: u64) -> Result<u64, String> {
     self.send_request("thread/rollback", json!({ "threadId": thread_id, "numTurns": num_turns }))
+  }
+
+  pub fn compact_thread(&self, thread_id: String) -> Result<u64, String> {
+    self.send_request("thread/compact/start", json!({ "threadId": thread_id }))
   }
 
   pub fn set_thread_goal(

@@ -10,6 +10,15 @@ export type ModelOption = {
   defaultEffort: string;
 };
 
+export type ContextUsageView = {
+  usedTokens: number;
+  maxTokens: number | null;
+  percent: number | null;
+  label: string;
+  detail: string;
+  compacting?: boolean;
+};
+
 export const FALLBACK_MODELS: ModelOption[] = [
   {
     id: 'gpt-5.5-codex',
@@ -106,6 +115,7 @@ type ModelReasoningPickerProps = {
   models: ModelOption[];
   selectedModel: string;
   selectedEffort: string;
+  contextUsage: ContextUsageView | null;
   disabled?: boolean;
   onModelChange: (model: string) => void;
   onEffortChange: (effort: string) => void;
@@ -115,6 +125,7 @@ export const ModelReasoningPicker = React.memo(function ModelReasoningPicker({
   models,
   selectedModel,
   selectedEffort,
+  contextUsage,
   disabled,
   onModelChange,
   onEffortChange,
@@ -156,7 +167,8 @@ export const ModelReasoningPicker = React.memo(function ModelReasoningPicker({
   }, [activeModel.defaultEffort, effortOptions, onEffortChange, selectedEffort]);
 
   return (
-    <div className="model-picker" ref={rootRef}>
+    <div className="model-picker model-picker-with-context" ref={rootRef}>
+      <ContextUsageIndicator usage={contextUsage} />
       <button
         ref={anchorRef}
         type="button"
@@ -229,3 +241,37 @@ export const ModelReasoningPicker = React.memo(function ModelReasoningPicker({
     </div>
   );
 });
+
+function ContextUsageIndicator({ usage }: { usage: ContextUsageView | null }) {
+  const percent = usage?.percent ?? 0;
+  const clamped = Math.max(0, Math.min(100, percent));
+  const high = clamped >= 85;
+  const medium = clamped >= 65;
+  const style = {
+    '--context-fill': `${clamped}%`,
+  } as React.CSSProperties;
+  const title = usage
+    ? `${usage.compacting ? '正在自动压缩上下文\n' : ''}${usage.label}\n${usage.detail}`
+    : '上下文用量会在 Codex 返回 tokenUsage 后显示';
+
+  return (
+    <div className={usage?.compacting ? 'context-usage compacting' : 'context-usage'} title={title}>
+      <span
+        className={
+          high
+            ? 'context-usage-ring high'
+            : medium
+              ? 'context-usage-ring medium'
+              : 'context-usage-ring'
+        }
+        style={style}
+        aria-hidden="true"
+      />
+      <div className="context-usage-popover">
+        <div className="context-usage-title">背景信息窗口：</div>
+        <div className="context-usage-percent">{usage?.percent != null ? `${Math.round(clamped)}% 已用` : '等待用量'}</div>
+        <div className="context-usage-detail">{usage?.detail ?? '发送一轮消息后显示上下文大小'}</div>
+      </div>
+    </div>
+  );
+}
